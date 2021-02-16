@@ -504,17 +504,17 @@ def test(inference_data, return_time_hr=None):
 
         total_loss += float(loss) * batch.num_events
 
-        h_max = 520
-        timestep = 10
+        h_max = 500
+        timestep = 1
         num_samples = int(h_max/timestep) + 1
-        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(src)).view(-1)
+        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(src)).view(-1).to(device)
 
         embeddings_u = z[assoc[src]].repeat(num_samples, 1)
         embeddings_v = z[assoc[pos_dst]].repeat(num_samples, 1)
 
-        intensity = dyrep.hawkes_intensity(embeddings_u, embeddings_v, all_td).view(-1, len(src))
-        # intensity = 0.5 * ( dyrep.hawkes_intensity(embeddings_u, embeddings_v, all_td).view(-1, len(src)) +
-        #                     dyrep.hawkes_intensity(embeddings_v, embeddings_u, all_td).view(-1, len(src)) )
+        # intensity = dyrep.hawkes_intensity(embeddings_u, embeddings_v, all_td).view(-1, len(src))
+        intensity = 0.5 * ( dyrep.hawkes_intensity(embeddings_u, embeddings_v, all_td).view(-1, len(src)) +
+                            dyrep.hawkes_intensity(embeddings_v, embeddings_u, all_td).view(-1, len(src)) )
         integral = torch.cumsum(timestep*intensity, dim=0)
         density = (intensity * torch.exp(-integral))
         t_sample = all_td.view(-1, len(src)) * density
