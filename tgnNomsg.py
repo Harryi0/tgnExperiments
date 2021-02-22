@@ -220,7 +220,7 @@ class DyRepDecoder(torch.nn.Module):
                 module.reset_parameters()
 
     def forward(self, all_embeddings, assoc, src, pos_dst, neg_dst_surv,
-                neg_src_surv=None, neg_dst=None, last_update=None, cur_time=None, et=None):
+                neg_src_surv=None, neg_dst=None, last_update=None, cur_time=None, et=None, tp=False):
 
         z_src, z_dst = all_embeddings[assoc[src]], all_embeddings[assoc[pos_dst]]
         z_neg_dst_surv = all_embeddings[assoc[neg_dst_surv]]
@@ -292,24 +292,25 @@ class DyRepDecoder(torch.nn.Module):
         loss_surv_v = torch.sum(surv_v) / self.num_surv_samples
 
         cond_density = []
-        if not self.training:
-            z_neg_dst = all_embeddings[assoc[neg_dst]]
-            if last_update is None:
-                lambda_uv_neg = self.compute_intensity_lambda(z_src, z_neg_dst)
-            else:
-                last_time_neg = torch.cat((last_update[assoc[src]].view(-1,1), last_update[assoc[neg_dst]].view(-1,1)), dim=1).max(-1)[0]
-                td_neg = cur_time - last_time_neg
-                lambda_uv_neg = self.hawkes_intensity(z_src, z_neg_dst, et, td_neg)
-                # td_neg = np.array(list(map(lambda x: datetime.fromtimestamp(int(x)), cur_time.numpy()))) - \
-                #          np.array(list(map(lambda x: datetime.fromtimestamp(int(x)), last_time_neg.numpy())))
-                #
-                # td_neg_hr = torch.tensor(list(map(lambda x: round(x.days * 24 + x.seconds / 3600, 3), td_neg)))
-            s = surv_u.view(-1, self.num_surv_samples).mean(dim=-1) + surv_v.view(-1, self.num_surv_samples).mean(dim=-1)
-            surv = torch.exp(-s)
-            assert len(z_src) == len(surv)
-            cond_pos = lambda_uv * surv
-            cond_neg = lambda_uv_neg * surv
-            cond_density = [cond_pos, cond_neg]
+        if (not self.training) or (neg_dst is not None):
+            with torch.no_grad():
+                z_neg_dst = all_embeddings[assoc[neg_dst]]
+                if last_update is None:
+                    lambda_uv_neg = self.compute_intensity_lambda(z_src, z_neg_dst)
+                else:
+                    last_time_neg = torch.cat((last_update[assoc[src]].view(-1,1), last_update[assoc[neg_dst]].view(-1,1)), dim=1).max(-1)[0]
+                    td_neg = cur_time - last_time_neg
+                    lambda_uv_neg = self.hawkes_intensity(z_src, z_neg_dst, et, td_neg)
+                    # td_neg = np.array(list(map(lambda x: datetime.fromtimestamp(int(x)), cur_time.numpy()))) - \
+                    #          np.array(list(map(lambda x: datetime.fromtimestamp(int(x)), last_time_neg.numpy())))
+                    #
+                    # td_neg_hr = torch.tensor(list(map(lambda x: round(x.days * 24 + x.seconds / 3600, 3), td_neg)))
+                s = surv_u.view(-1, self.num_surv_samples).mean(dim=-1) + surv_v.view(-1, self.num_surv_samples).mean(dim=-1)
+                surv = torch.exp(-s)
+                assert len(z_src) == len(surv)
+                cond_pos = lambda_uv * surv
+                cond_neg = lambda_uv_neg * surv
+                cond_density = [cond_pos, cond_neg]
         # return loss_lambda/len(z_src), loss_surv/len(z_src)
         return loss_lambda/len(z_src), loss_surv_u/len(z_src), loss_surv_v/len(z_src), cond_density
 
@@ -372,7 +373,7 @@ gnn = GraphAttentionEmbedding(
     time_enc=memory.time_enc,
 ).to(device)
 
-num_surv_samples = 20
+num_surv_samples = 50
 num_time_samples = 5
 
 dyrep = DyRepDecoder(
@@ -496,7 +497,7 @@ def time_pred_unitsample(batch_src, batch_pos_dst, batch_link_type, batch_z, bat
     return return_time_pred
 
 
-def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_prediction=False):
+def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_prediction=False, link_prediction=False):
     dataset_len = dataset.num_events
 
     memory.train()
@@ -512,6 +513,7 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
     total_loss = 0
     total_loss_lambda, total_loss_surv_u, total_loss_surv_v = 0, 0, 0
     total_mae = 0
+    aps = []
 
     for batch_id, batch in enumerate(tqdm(dataset.seq_batches(batch_size=batch_size), total=total_batches)):
         optimizer.zero_grad()
@@ -519,6 +521,10 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
         src, pos_dst, t, link_type = batch.src, batch.dst, batch.t, batch.y
 
         all_neg_nodes = np.delete(np.arange(num_nodes), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
+
+        neg_dst = torch.tensor(random_state.choice(all_neg_nodes, size=src.size(0),
+                                                replace=len(all_neg_nodes) < src.size(0)),
+                               device=device)
 
         all_neg_surv = torch.tensor(random_state.choice(all_neg_nodes, size=src.size(0)*num_surv_samples*2,
                                                 replace=len(all_neg_nodes) < src.size(0)*num_surv_samples*2),
@@ -528,7 +534,7 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
 
         # n_id = torch.cat([src, pos_dst, neg_dst]).unique()
         ######### only contained sampled negative
-        n_id = torch.cat([src, pos_dst, all_neg_surv]).unique()
+        n_id = torch.cat([src, pos_dst, all_neg_surv, neg_dst]).unique()
 
         n_id, edge_index, e_id = neighbor_loader(n_id)
         assoc[n_id] = torch.arange(n_id.size(0), device=device)
@@ -544,9 +550,22 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
         # loss += criterion(neg_out, torch.zeros_like(neg_out))
 
         # loss = dyrep(z[assoc[src]], z[assoc[pos_dst]], z[assoc[neg_dst]])
-        loss_lambda, loss_surv_u, loss_surv_v, _ = dyrep(z, assoc, src, pos_dst, neg_dst_surv,
-                                                         neg_src_surv=neg_src_surv, last_update=last_update, cur_time=t,
-                                                         et=link_type)
+        if link_prediction:
+            loss_lambda, loss_surv_u, loss_surv_v, cond = dyrep(z, assoc, src, pos_dst, neg_dst_surv,
+                                                             neg_src_surv=neg_src_surv, last_update=last_update, cur_time=t,
+                                                             et=link_type, neg_dst=neg_dst)
+            pos_out, neg_out = cond[0], cond[1]
+            y_pred = torch.cat([pos_out, neg_out], dim=0).cpu()
+            y_true = torch.cat(
+                [torch.ones(pos_out.size(0)),
+                 torch.zeros(neg_out.size(0))], dim=0)
+            ap = average_precision_score(y_true, y_pred)
+            aps.append(ap)
+
+        else:
+            loss_lambda, loss_surv_u, loss_surv_v, _ = dyrep(z, assoc, src, pos_dst, neg_dst_surv,
+                                                             neg_src_surv=neg_src_surv, last_update=last_update, cur_time=t,
+                                                             et=link_type)
         loss = loss_lambda + loss_surv_u + loss_surv_v
 
 
@@ -567,8 +586,8 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
         if (batch_id) % 50 == 0:
             if batch_id==0:
                 first_batch.append(loss)
-            print("Batch {}, Loss {}, loss_lambda {}, loss_surv_u {}, loss_surv_v {}, time prediction mae {}".format(
-                batch_id+1, loss, loss_lambda, loss_surv_u, loss_surv_v, mae))
+            print("Batch {}, Loss {}, loss_lambda {}, loss_surv_u {}, loss_surv_v {}, time prediction mae {}, link pred ap {}".format(
+                batch_id+1, loss, loss_lambda, loss_surv_u, loss_surv_v, mae, ap))
 
         # Update memory and neighbor loader with ground-truth state.
         memory.update_state(src, pos_dst, t, None) #link_embedding(link_type).detach()
@@ -593,7 +612,7 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
         #     break
 
     return total_loss/dataset_len, total_loss_lambda/dataset_len, \
-           total_loss_surv_u/dataset_len, total_loss_surv_v/dataset_len, total_mae/dataset_len
+           total_loss_surv_u/dataset_len, total_loss_surv_v/dataset_len, total_mae/dataset_len, float(torch.tensor(aps).mean())
 
 
 @torch.no_grad()
@@ -676,25 +695,27 @@ def test(inference_data, return_time_hr=None):
            total_maes/inference_data.num_events
 
 all_loss, all_loss_lambda, all_loss_surv_u, all_loss_surv_v  = [], [], [], []
-all_train_mae =  []
+all_train_mae, all_train_ap = [], []
 all_val_loss, all_test_loss = [], []
 all_val_ap, all_val_auc, all_test_ap, all_test_auc = [], [], [], []
 all_val_mae, all_test_mae = [], []
-epochs = 20
+epochs = 100
 epochs_no_improve = 0
 patience = 20
 early_stop = False
-min_test_mae = float('inf')
+min_target = float('inf')
 for epoch in range(1, epochs+1): #51
     # , return_time_hr=train_return_hr, time_prediction=False
-    loss, loss_lambda, loss_surv_u, loss_surv_v, train_mae = train(train_data, return_time_hr=train_return_hr, time_prediction=False)#, batch_size=5, total_batches=4
+    loss, loss_lambda, loss_surv_u, loss_surv_v, train_mae, train_ap = train(train_data, return_time_hr=train_return_hr,
+                                                                             time_prediction=True, link_prediction=True)#, batch_size=5, total_batches=4
     all_loss.append(loss)
     all_loss_lambda.append(loss_lambda)
     all_loss_surv_u.append(loss_surv_u)
     all_loss_surv_v.append(loss_surv_v)
     all_train_mae.append(train_mae)
+    all_train_ap.append(train_ap)
     print(f'  Epoch: {epoch:02d}, Loss: {loss:.4f}, loss_lambda:{loss_lambda:.4f}, '
-          f'loss_surv_u:{loss_surv_u:.4f}, loss_surv_v:{loss_surv_v: .4f}, train mae {train_mae:.4f}')
+          f'loss_surv_u:{loss_surv_u:.4f}, loss_surv_v:{loss_surv_v: .4f}, train ap {train_ap: .4f}, train mae {train_mae:.4f}')
     test_ap, test_auc, test_loss, test_mae = test(test_data, test_return_hr)
     print(f' Epoch: {epoch:02d}, Val AP: {test_ap:.4f},  Val AUC: {test_auc:.4f}, Val LOSS: {test_loss:.4f}, Val MAE: {test_mae:.4f}')
     all_test_ap.append(test_ap)
@@ -702,11 +723,13 @@ for epoch in range(1, epochs+1): #51
     all_test_loss.append(test_loss)
     all_test_mae.append(test_mae)
     if early_stop:
-        if test_mae < min_test_mae:
+        if test_mae < min_target:
             epochs_no_improve += 1
             if epochs_no_improve == patience:
                 break
-            min_test_mae = test_mae
+            min_target = test_mae
+
+print(f'Minimum time prediction MAE in the test set: {min_target: .4f}')
 
 
     # val_ap, val_auc, val_loss, val_mae = test(val_data, val_return_hr)
@@ -716,18 +739,21 @@ for epoch in range(1, epochs+1): #51
     # all_val_loss.append(val_loss)
     # all_val_mae.append(val_mae)
 
-fig = plt.figure(figsize=(12, 5))
-ax = plt.subplot(1,2,1)
+fig = plt.figure(figsize=(18, 5))
+ax = plt.subplot(1,3,1)
 plt.plot(np.arange(1, len(all_loss)+1), np.array(all_loss), 'k', label='total loss')
 plt.plot(np.arange(1, len(all_loss_lambda)+1), np.array(all_loss_lambda), 'r', label='loss events')
 plt.plot(np.arange(1, len(all_loss_surv_u)+1), np.array(all_loss_surv_u), 'b', label='loss nonevents (neg dst)')
 plt.plot(np.arange(1, len(all_loss_surv_v)+1), np.array(all_loss_surv_v), 'g', label='loss nonevents (neg src)')
 plt.legend()
 plt.title("train loss")
-plt.subplot(1,2,2)
-plt.plot(np.arange(1,len(all_train_mae)+1), np.array(all_train_mae), 'r')
+plt.subplot(1,3,2)
+plt.plot(np.arange(1,len(all_train_ap)+1), np.array(all_train_ap), 'r')
+plt.title("train link prediction ap")
+plt.subplot(1,3,3)
+plt.plot(np.arange(1,len(all_train_mae)+1), np.array(all_train_mae), 'b')
 plt.title("train time prediction mae")
-fig.savefig('tgnHawkes_wiki_oneSurv_train.png')
+fig.savefig('tgn_social_train.png')
 
 fig2 = plt.figure(figsize=(18, 5))
 plt.subplot(1,3,1)
@@ -739,7 +765,7 @@ plt.title("test ap")
 plt.subplot(1,3,3)
 plt.plot(np.arange(1, len(all_test_mae)+1), np.array(all_test_mae), 'b', label='total loss')
 plt.title("test mae")
-fig2.savefig('tgnHawkes_wiki_oneSurv_val.png')
+fig2.savefig('tgn_social_test.png')
 # fig.savefig('tgnHawkes_20events_twoSurv_lr1e-3.png')
 # fig2.savefig('tgnHawkesFirstBatch_allData_twoSurv_lr1e-3.png')
     # val_ap, val_auc = test(val_data, val_return_hr)
