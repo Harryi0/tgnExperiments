@@ -373,7 +373,7 @@ gnn = GraphAttentionEmbedding(
     time_enc=memory.time_enc,
 ).to(device)
 
-num_surv_samples = 50
+num_surv_samples = 20
 num_time_samples = 5
 
 dyrep = DyRepDecoder(
@@ -475,7 +475,7 @@ def time_pred(batch_src, batch_pos_dst, batch_t, batch_link_type, batch_last_upd
 def time_pred_unitsample(batch_src, batch_pos_dst, batch_link_type, batch_z, batch_assoc, symmetric=True):
     with torch.no_grad():
         num_samples = int(h_max / timestep) + 1
-        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(batch_src)).view(-1)
+        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(batch_src)).view(-1).to(device)
 
         embeddings_u = batch_z[batch_assoc[batch_src]].repeat(num_samples, 1)
         embeddings_v = batch_z[batch_assoc[batch_pos_dst]].repeat(num_samples, 1)
@@ -520,7 +520,7 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
 
         src, pos_dst, t, link_type = batch.src, batch.dst, batch.t, batch.y
 
-        all_neg_nodes = np.delete(np.arange(num_nodes), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
+        all_neg_nodes = np.delete(np.arange(num_nodes.cpu().numpy()), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
 
         neg_dst = torch.tensor(random_state.choice(all_neg_nodes, size=src.size(0),
                                                 replace=len(all_neg_nodes) < src.size(0)),
@@ -631,7 +631,7 @@ def test(inference_data, return_time_hr=None):
     for batch_id, batch in enumerate(tqdm(inference_data.seq_batches(batch_size=200), total=53)):
         src, pos_dst, t, link_type = batch.src, batch.dst, batch.t, batch.y
 
-        all_neg_nodes = np.delete(np.arange(num_nodes), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
+        all_neg_nodes = np.delete(np.arange(num_nodes.cpu().numpy()), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
 
         neg_dst = torch.tensor(random_state.choice(all_neg_nodes, size=src.size(0),
                                                 replace=len(all_neg_nodes) < src.size(0)),
@@ -646,7 +646,7 @@ def test(inference_data, return_time_hr=None):
         ####### include all dst nodes
         # n_id = torch.cat([all_src, all_dst]).unique()
         # n_id = torch.cat([src, all_dst]).unique()
-        n_id = torch.arange(num_nodes)
+        n_id = torch.arange(num_nodes, device=device)
 
         n_id, edge_index, e_id = neighbor_loader(n_id)
         assoc[n_id] = torch.arange(n_id.size(0), device=device)
@@ -702,7 +702,7 @@ all_val_mae, all_test_mae = [], []
 epochs = 100
 epochs_no_improve = 0
 patience = 20
-early_stop = False
+early_stop = True
 min_target = float('inf')
 for epoch in range(1, epochs+1): #51
     # , return_time_hr=train_return_hr, time_prediction=False
@@ -724,13 +724,11 @@ for epoch in range(1, epochs+1): #51
     all_test_mae.append(test_mae)
     if early_stop:
         if test_mae < min_target:
+            min_target = test_mae
+        else:
             epochs_no_improve += 1
             if epochs_no_improve == patience:
                 break
-            min_target = test_mae
-
-print(f'Minimum time prediction MAE in the test set: {min_target: .4f}')
-
 
     # val_ap, val_auc, val_loss, val_mae = test(val_data, val_return_hr)
     # print(f' Val AP: {val_ap:.4f},  Val AUC: {val_auc:.4f}, Val LOSS: {val_loss:.4f}, Val MAE: {val_mae:.4f}')
@@ -766,6 +764,12 @@ plt.subplot(1,3,3)
 plt.plot(np.arange(1, len(all_test_mae)+1), np.array(all_test_mae), 'b', label='total loss')
 plt.title("test mae")
 fig2.savefig('tgn_social_test.png')
+
+
+
+print(f'Minimum time prediction MAE in the test set: {min_target: .4f}')
+print('Max link prediction ap in the test set: {}'.format(max(all_test_ap)))
+
 # fig.savefig('tgnHawkes_20events_twoSurv_lr1e-3.png')
 # fig2.savefig('tgnHawkesFirstBatch_allData_twoSurv_lr1e-3.png')
     # val_ap, val_auc = test(val_data, val_return_hr)
