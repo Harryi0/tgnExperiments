@@ -209,25 +209,26 @@ class DyRepDecoder(torch.nn.Module):
         loss_surv_v = torch.sum(surv_v) / self.num_surv_samples
 
         cond_density = []
-        if not self.training:
-            z_neg_dst = all_embeddings[assoc[neg_dst]]
-            if last_update is None:
-                lambda_uv_neg = self.compute_intensity_lambda(z_src, z_neg_dst)
-            else:
-                last_time_neg = torch.cat((last_update[assoc[src]].view(-1,1), last_update[assoc[neg_dst]].view(-1,1)), dim=1).max(-1)[0]
-                td_neg = cur_time - last_time_neg
-                lambda_uv_neg = self.hawkes_intensity(z_src, z_neg_dst, td_neg)
-                # td_neg = np.array(list(map(lambda x: datetime.fromtimestamp(int(x)), cur_time.numpy()))) - \
-                #          np.array(list(map(lambda x: datetime.fromtimestamp(int(x)), last_time_neg.numpy())))
-                #
-                # td_neg_hr = torch.tensor(list(map(lambda x: round(x.days * 24 + x.seconds / 3600, 3), td_neg)))
-            s = surv_u.view(-1, self.num_surv_samples).mean(dim=-1) + surv_v.view(-1, self.num_surv_samples).mean(dim=-1)
-            surv = torch.exp(-s)
-            assert len(z_src) == len(surv)
-            cond_pos = lambda_uv * surv
-            cond_neg = lambda_uv_neg * surv
-            cond_density = [cond_pos, cond_neg]
-        # return loss_lambda/len(z_src), loss_surv/len(z_src)
+        if (not self.training) or (neg_dst is not None):
+            with torch.no_grad():
+                z_neg_dst = all_embeddings[assoc[neg_dst]]
+                if last_update is None:
+                    lambda_uv_neg = self.compute_intensity_lambda(z_src, z_neg_dst)
+                else:
+                    last_time_neg = torch.cat((last_update[assoc[src]].view(-1,1), last_update[assoc[neg_dst]].view(-1,1)), dim=1).max(-1)[0]
+                    td_neg = cur_time - last_time_neg
+                    lambda_uv_neg = self.hawkes_intensity(z_src, z_neg_dst, td_neg)
+                    # td_neg = np.array(list(map(lambda x: datetime.fromtimestamp(int(x)), cur_time.numpy()))) - \
+                    #          np.array(list(map(lambda x: datetime.fromtimestamp(int(x)), last_time_neg.numpy())))
+                    #
+                    # td_neg_hr = torch.tensor(list(map(lambda x: round(x.days * 24 + x.seconds / 3600, 3), td_neg)))
+                s = surv_u.view(-1, self.num_surv_samples).mean(dim=-1) + surv_v.view(-1, self.num_surv_samples).mean(dim=-1)
+                surv = torch.exp(-s)
+                assert len(z_src) == len(surv)
+                cond_pos = lambda_uv * surv
+                cond_neg = lambda_uv_neg * surv
+                cond_density = [cond_pos, cond_neg]
+
         return loss_lambda/len(z_src), loss_surv_u/len(z_src), loss_surv_v/len(z_src), cond_density
 
     def hawkes_intensity(self, z_u, z_v, td, symmetric=False):
@@ -393,10 +394,10 @@ def time_pred(batch_src, batch_pos_dst, batch_t, batch_msg, batch_last_update, b
     return return_time_pred
 
 
-def time_pred_unitsample(batch_src, batch_pos_dst, batch_link_type, batch_z, batch_assoc, symmetric=True):
+def time_pred_unitsample(batch_src, batch_pos_dst, batch_z, batch_assoc, symmetric=True):
     with torch.no_grad():
         num_samples = int(h_max / timestep) + 1
-        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(batch_src)).view(-1)
+        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(batch_src)).view(-1).to(device)
 
         embeddings_u = batch_z[batch_assoc[batch_src]].repeat(num_samples, 1)
         embeddings_v = batch_z[batch_assoc[batch_pos_dst]].repeat(num_samples, 1)
@@ -413,7 +414,7 @@ def time_pred_unitsample(batch_src, batch_pos_dst, batch_link_type, batch_z, bat
         return_time_pred = (timestep * 0.5 * (t_sample[:-1] + t_sample[1:])).sum(dim=0)
     return return_time_pred
 
-def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_prediction=False):
+def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_prediction=False, link_prediction=False):
     dataset_len = dataset.num_events
 
     memory.train()
@@ -427,11 +428,11 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
     total_loss = 0
     total_loss_lambda, total_loss_surv_u, total_loss_surv_v = 0, 0, 0
     total_mae = 0
+    aps = []
+    ap, mae = 0, 0
 
     for batch_id, batch in enumerate(tqdm(dataset.seq_batches(batch_size=batch_size), total=total_batches)):
         optimizer.zero_grad()
-        # optimizer_enc.zero_grad()
-        # optimizer_dec.zero_grad()
 
         src, pos_dst, t, msg = batch.src, batch.dst, batch.t, batch.msg
 
@@ -444,6 +445,9 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
             neg_dst_surv = torch.tensor(random_state.choice(neg_dst_nodes, size=src.size(0)*num_surv_samples,
                                                             replace=len(neg_dst_nodes) < src.size(0)*num_surv_samples),
                                         device=device)
+
+            neg_dst = torch.tensor(random_state.choice(neg_dst_nodes, size=src.size(0),
+                                                            replace=len(neg_dst_nodes) < src.size(0)),device=device)
             ################ Sample negative source nodes all src
             # neg_src_surv = torch.randint(min_src_idx, max_src_idx + 1, (src.size(0)*num_surv_samples, ),
             #                              dtype=torch.long, device=device)
@@ -460,12 +464,8 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
             neg_dst_surv = all_neg_surv[:num_surv_samples]
             neg_src_surv = all_neg_surv[num_surv_samples:]
 
-        # n_id = torch.cat([src, pos_dst, neg_dst]).unique()
         ######### only contained sampled negative
-        n_id = torch.cat([src, pos_dst, neg_dst_surv, neg_src_surv]).unique()
-        # n_id = torch.cat([src, pos_dst, neg_dst_surv]).unique()
-        ######### include all of the negative nodes (only dst)
-        # n_id=torch.cat([src, pos_dst, torch.arange(min_dst_idx, max_dst_idx+1)])
+        n_id = torch.cat([src, pos_dst, neg_dst_surv, neg_src_surv, neg_dst]).unique()
 
         n_id, edge_index, e_id = neighbor_loader(n_id)
         assoc[n_id] = torch.arange(n_id.size(0), device=device)
@@ -474,20 +474,34 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
         z, last_update = memory(n_id)
         z = gnn(z, last_update, edge_index, data.t[e_id], data.msg[e_id])
 
-        # loss = dyrep(z[assoc[src]], z[assoc[pos_dst]], z[assoc[neg_dst]])
-        loss_lambda, loss_surv_u, loss_surv_v, _ = dyrep(z, assoc, src, pos_dst, neg_dst_surv,
-                                                         neg_src_surv=neg_src_surv, last_update=last_update, cur_time=t)
+        if link_prediction:
+            loss_lambda, loss_surv_u, loss_surv_v, cond = dyrep(z, assoc, src, pos_dst, neg_dst_surv,
+                                                             neg_src_surv=neg_src_surv, last_update=last_update,
+                                                             cur_time=t, neg_dst=neg_dst)
+            pos_out, neg_out = cond[0], cond[1]
+            y_pred = torch.cat([pos_out, neg_out], dim=0).cpu()
+            y_true = torch.cat(
+                [torch.ones(pos_out.size(0)),
+                 torch.zeros(neg_out.size(0))], dim=0)
+            ap = average_precision_score(y_true, y_pred)
+            aps.append(ap)
+
+        else:
+            loss_lambda, loss_surv_u, loss_surv_v, _ = dyrep(z, assoc, src, pos_dst, neg_dst_surv,
+                                                             neg_src_surv=neg_src_surv, last_update=last_update,
+                                                             cur_time=t)
+
         loss = loss_lambda + loss_surv_u + loss_surv_v
 
         if time_prediction:
             ########## random sample step for time
-            return_time_pred = time_pred(src, pos_dst, t, msg, last_update, assoc, z, random_state,
-                                         neg_src_nodes, neg_dst_nodes)
-            return_time_pred = return_time_pred.cpu().numpy() * train_td_hr_std + train_td_hr_mean
+            # return_time_pred = time_pred(src, pos_dst, t, msg, last_update, assoc, z, random_state,
+            #                              neg_src_nodes, neg_dst_nodes)
+            # return_time_pred = return_time_pred.cpu().numpy() * train_td_hr_std + train_td_hr_mean
             # return_time_pred = return_time_pred.cpu().numpy()
             ########## unit sample and time step for time prediction
-            # return_time_pred = time_pred_unitsample(src, pos_dst, link_type, z, assoc, symmetric=True)
-            # return_time_pred = return_time_pred.cpu().numpy()
+            return_time_pred = time_pred_unitsample(src, pos_dst, z, assoc, symmetric=True)
+            return_time_pred = return_time_pred.cpu().numpy()
 
             mae = np.mean(abs(return_time_pred - return_time_hr[batch_id * batch_size:(batch_id * batch_size + batch.num_events)]))
             total_mae += mae*len(batch.src)
@@ -495,8 +509,8 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
         if (batch_id) % 100 == 0:
             if batch_id==0:
                 first_batch.append(loss)
-            print("Batch {}, Loss {}, loss_lambda {}, loss_surv_u {}, loss_surv_v {}".format(
-                batch_id+1, loss, loss_lambda, loss_surv_u, loss_surv_v))
+            print("Batch {}, Loss {}, loss_lambda {}, loss_surv_u {}, loss_surv_v {}, mae {}, ap {}".format(
+                batch_id+1, loss, loss_lambda, loss_surv_u, loss_surv_v, mae, ap))
 
         # Update memory and neighbor loader with ground-truth state.
         memory.update_state(src, pos_dst, t, msg)
@@ -519,7 +533,7 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
         #     break
 
     return total_loss / dataset_len, total_loss_lambda/dataset_len, \
-           total_loss_surv_u/dataset_len, total_loss_surv_v/dataset_len, total_mae/dataset_len
+           total_loss_surv_u/dataset_len, total_loss_surv_v/dataset_len, total_mae/dataset_len,  float(torch.tensor(aps).mean())
 
 
 @torch.no_grad()
@@ -537,14 +551,6 @@ def test(inference_data, return_time_hr=None):
     for batch_id, batch in enumerate(tqdm(inference_data.seq_batches(batch_size=200), total=119)):
         src, pos_dst, t, msg = batch.src, batch.dst, batch.t, batch.msg
 
-        # neg_dst = torch.randint(min_dst_idx, max_dst_idx + 1, (src.size(0), ),
-        #                         dtype=torch.long, device=device)
-
-        # Negative sampling for the survival function
-
-        # neg_dst_surv = torch.randint(min_dst_idx, max_dst_idx + 1, (src.size(0)*num_surv_samples, ),
-        #                              dtype=torch.long, device=device)
-
         neg_dst_nodes = np.delete(np.arange(min_dst_idx, max_dst_idx + 1), pos_dst.cpu().numpy() - min_dst_idx)
 
         neg_dst = torch.tensor(random_state.choice(neg_dst_nodes, size=src.size(0),
@@ -555,9 +561,6 @@ def test(inference_data, return_time_hr=None):
                                                 replace=len(neg_dst_nodes) < src.size(0)*num_surv_samples),
                                     device=device)
 
-        # neg_src_surv = torch.randint(min_src_idx, max_src_idx + 1, (src.size(0)*num_surv_samples, ),
-        #                              dtype=torch.long, device=device)
-
         neg_src_nodes = np.delete(np.arange(min_src_idx, max_src_idx + 1), src.cpu().numpy() - min_src_idx)
         neg_src_surv = torch.tensor(random_state.choice(neg_src_nodes, size=src.size(0)*num_surv_samples,
                                                 replace=len(neg_src_nodes) < src.size(0)*num_surv_samples),
@@ -566,13 +569,7 @@ def test(inference_data, return_time_hr=None):
         all_dst = torch.arange(min_dst_idx, max_dst_idx+1, device=device)
         all_src = torch.arange(min_src_idx, max_src_idx+1, device=device)
 
-        # n_id = torch.cat([src, pos_dst, neg_dst]).unique()
-        # n_id = torch.cat([src, pos_dst, neg_dst_surv, neg_src_surv, neg_dst]).unique()
-        # n_id = torch.cat([src, pos_dst, neg_dst_surv, neg_dst]).unique()
-        # n_id = torch.cat([src, all_dst, neg_src_surv]).unique()
-        ####### include all dst nodes
         n_id = torch.cat([all_src, all_dst]).unique()
-        # n_id = torch.cat([src, all_dst]).unique()
 
         n_id, edge_index, e_id = neighbor_loader(n_id)
         assoc[n_id] = torch.arange(n_id.size(0), device=device)
@@ -584,14 +581,14 @@ def test(inference_data, return_time_hr=None):
         loss_lambda, loss_surv_u, loss_surv_v, cond = dyrep(z, assoc, src, pos_dst, neg_dst_surv,
                                                             neg_src_surv=neg_src_surv, neg_dst=neg_dst,
                                                             last_update=last_update, cur_time = t)
-        # loss = dyrep(z, last_update, t, assoc, src, pos_dst, neg_src_surv, neg_dst_surv)
         pos_out, neg_out = cond[0], cond[1]
         y_pred = torch.cat([pos_out, neg_out], dim=0).cpu()
         y_true = torch.cat(
             [torch.ones(pos_out.size(0)),
              torch.zeros(neg_out.size(0))], dim=0)
 
-        aps.append(average_precision_score(y_true, y_pred))
+        ap = average_precision_score(y_true, y_pred)
+        aps.append(ap)
         aucs.append(roc_auc_score(y_true, y_pred))
 
         loss = loss_lambda + loss_surv_u + loss_surv_v
@@ -602,20 +599,20 @@ def test(inference_data, return_time_hr=None):
         # neighbor_loader.insert(src, pos_dst)
 
         ########## random sample step for time
-        return_time_pred = time_pred(src, pos_dst, t, msg, last_update, assoc, z, random_state,
-                                     neg_src_nodes, neg_dst_nodes)
-        return_time_pred = return_time_pred.cpu().numpy() * train_td_hr_std + train_td_hr_mean
+        # return_time_pred = time_pred(src, pos_dst, t, msg, last_update, assoc, z, random_state,
+        #                              neg_src_nodes, neg_dst_nodes)
+        # return_time_pred = return_time_pred.cpu().numpy() * train_td_hr_std + train_td_hr_mean
         # return_time_pred = return_time_pred.cpu().numpy()
         ########## unit sample and time step for time prediction
-        # return_time_pred = time_pred_unitsample(src, pos_dst, link_type, z, assoc, symmetric=True)
-        # return_time_pred = return_time_pred.cpu().numpy()
+        return_time_pred = time_pred_unitsample(src, pos_dst, z, assoc, symmetric=True)
+        return_time_pred = return_time_pred.cpu().numpy()
 
         memory.update_state(src, pos_dst, t, msg)
         neighbor_loader.insert(src, pos_dst)
 
         mae = np.mean(abs(return_time_pred - return_time_hr[batch_id*200:(batch_id*200+batch.num_events)]))
         if batch_id % 20 == 0:
-            print("Test Batch {}, MAE for time prediction {}, loss {}".format(batch_id+1, mae, loss))
+            print("Test Batch {}, loss {}, MAE for time prediction {}, ap {}".format(batch_id+1, loss, mae, ap))
         total_maes += mae*len(batch.src)
         time_maes.append(mae)
 
@@ -624,27 +621,40 @@ def test(inference_data, return_time_hr=None):
     return float(torch.tensor(aps).mean()), float(torch.tensor(aucs).mean()), total_loss/inference_data.num_events, total_maes/inference_data.num_events
 
 all_loss, all_loss_lambda, all_loss_surv_u, all_loss_surv_v  = [], [], [], []
-all_train_mae =  []
+all_train_mae, all_train_ap = [], []
 all_val_loss, all_test_loss = [], []
 all_val_ap, all_val_auc, all_test_ap, all_test_auc = [], [], [], []
 all_val_mae, all_test_mae = [], []
-epochs = 20
+epochs = 100
+epochs_no_improve = 0
+patience = 20
+early_stop = True
+min_target = float('inf')
 for epoch in range(1, epochs+1): #51
     # , return_time_hr=train_return_hr, time_prediction=False
-    loss, loss_lambda, loss_surv_u, loss_surv_v, train_mae = train(train_data, return_time_hr=train_return_hr, time_prediction=False)#, batch_size=5, total_batches=4
+    loss, loss_lambda, loss_surv_u, loss_surv_v, train_mae, train_ap = train(train_data, return_time_hr=train_return_hr,
+                                                                             time_prediction=True, link_prediction=True)#, batch_size=5, total_batches=4
     all_loss.append(loss)
     all_loss_lambda.append(loss_lambda)
     all_loss_surv_u.append(loss_surv_u)
     all_loss_surv_v.append(loss_surv_v)
     all_train_mae.append(train_mae)
+    all_train_ap.append(train_ap)
     print(f'  Epoch: {epoch:02d}, Loss: {loss:.4f}, loss_lambda:{loss_lambda:.4f}, '
-          f'loss_surv_u:{loss_surv_u:.4f}, loss_surv_v:{loss_surv_v: .4f}, train mae {train_mae:.4f}')
+          f'loss_surv_u:{loss_surv_u:.4f}, loss_surv_v:{loss_surv_v: .4f}, train mae {train_mae:.4f}, train ap {train_ap: .4f}')
     val_ap, val_auc, val_loss, val_mae = test(val_data, val_return_hr)
     print(f' Epoch: {epoch:02d}, Val AP: {val_ap:.4f},  Val AUC: {val_auc:.4f}, Val LOSS: {val_loss:.4f}, Val MAE: {val_mae:.4f}')
     all_test_ap.append(val_ap)
     all_test_auc.append(val_auc)
     all_test_loss.append(val_loss)
     all_test_mae.append(val_mae)
+    if early_stop:
+        if val_mae < min_target:
+            min_target = val_mae
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve == patience:
+                break
     # test_ap, test_auc, test_loss = test(test_data)
     # print(f'Test AP: {test_ap:.4f}, Test AUC: {test_auc:.4f}')
     # all_test_ap.append(test_ap)
@@ -653,16 +663,19 @@ for epoch in range(1, epochs+1): #51
     # print(f' Val AP: {val_ap:.4f},  Val AUC: {val_auc:.4f}')
     # print(f'Test AP: {test_ap:.4f}, Test AUC: {test_auc:.4f}')
 
-fig = plt.figure(figsize=(12, 5))
-ax = plt.subplot(1,2,1)
-plt.plot(np.arange(1, epochs+1), np.array(all_loss), 'k', label='total loss')
-plt.plot(np.arange(1, epochs+1), np.array(all_loss_lambda), 'r', label='loss events')
-plt.plot(np.arange(1, epochs+1), np.array(all_loss_surv_u), 'b', label='loss nonevents (neg dst)')
-plt.plot(np.arange(1, epochs+1), np.array(all_loss_surv_v), 'g', label='loss nonevents (neg src)')
+fig = plt.figure(figsize=(18, 5))
+ax = plt.subplot(1,3,1)
+plt.plot(np.arange(1, len(all_loss)+1), np.array(all_loss), 'k', label='total loss')
+plt.plot(np.arange(1, len(all_loss_lambda)+1), np.array(all_loss_lambda), 'r', label='loss events')
+plt.plot(np.arange(1, len(all_loss_surv_u)+1), np.array(all_loss_surv_u), 'b', label='loss nonevents (neg dst)')
+plt.plot(np.arange(1, len(all_loss_surv_v)+1), np.array(all_loss_surv_v), 'g', label='loss nonevents (neg src)')
 plt.legend()
 plt.title("train loss")
-plt.subplot(1,2,2)
-plt.plot(np.arange(1,epochs+1), np.array(all_train_mae), 'r')
+plt.subplot(1,3,2)
+plt.plot(np.arange(1, len(all_train_ap)+1), np.array(all_train_ap), 'r')
+plt.title("train link prediction ap")
+plt.subplot(1,3,3)
+plt.plot(np.arange(1, len(all_train_mae)+1), np.array(all_train_mae), 'b')
 plt.title("train time prediction mae")
 fig.savefig('tgnHawkes_wiki_oneSurv_train.png')
 
