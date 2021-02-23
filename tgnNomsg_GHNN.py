@@ -404,7 +404,7 @@ class Decoder(torch.nn.Module):
     def forward(self, all_embeddings, assoc, src, pos_dst, neg_dst, last_update, cur_time, et):
 
         z_src, z_dst = all_embeddings[assoc[src]], all_embeddings[assoc[pos_dst]]
-        z_dst_neg = all_embeddings[assoc[neg_dst]]
+        # z_dst_neg = all_embeddings[assoc[neg_dst]]
 
         # last_time_pos = torch.cat((last_update[assoc[src]].view(-1, 1),
         #                            last_update[assoc[pos_dst]].view(-1, 1)), dim=1).max(-1)[0]
@@ -651,7 +651,7 @@ def time_pred_unitsample(batch_src, batch_pos_dst, batch_link_type, batch_z, bat
 
 def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_prediction=False, link_prediction=False):
     dataset_len = dataset.num_events
-    return_time_hr = torch.tensor(return_time_hr, dtype=float).to(device)
+    # return_time_hr = torch.tensor(return_time_hr, dtype=float).to(device)
 
     memory.train()
     gnn.train()
@@ -683,7 +683,7 @@ def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_predic
 
 
         neg_dst = torch.tensor(random_state.choice(all_neg_nodes, size=src.size(0),
-                                                replace=len(all_neg_nodes) < src.size(0)),device=device)
+                                                replace=len(all_neg_nodes) < src.size(0)), device=device)
 
         # n_id = torch.cat([src, pos_dst, neg_dst]).unique()
         # n_id = torch.cat([src, pos_dst, neg_dst, neg_dst_surv, neg_src_surv]).unique()
@@ -754,8 +754,8 @@ def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_predic
         total_lp_loss += float(lp_loss) * batch.num_events
         total_tp_loss += float(tp_loss) * batch.num_events
 
-        # if batch_id > 20:
-        #     break
+        if batch_id > 20:
+            break
 
     return total_loss/dataset_len, total_lp_loss/dataset_len, \
            total_tp_loss/dataset_len, float(torch.tensor(all_aps).mean()), total_mae/dataset_len
@@ -770,7 +770,7 @@ def test(inference_data, return_time_hr, batch_size=200, total_batches=53):
     torch.manual_seed(12345)  # Ensure deterministic sampling across epochs.
     random_state = np.random.RandomState(12345)
 
-    return_time_hr = torch.tensor(return_time_hr).to(device)
+    # return_time_hr = torch.tensor(return_time_hr).to(device)
 
     total_loss = 0
     total_lp_loss, total_tp_loss = 0, 0
@@ -843,6 +843,8 @@ epochs_no_improve = 0
 patience = 20
 early_stop = False
 min_test_mae = float('inf')
+train_return_hr = torch.tensor(train_return_hr, device=device)
+test_return_hr = torch.tensor(test_return_hr, device=device)
 for epoch in range(1, epochs+1): #51
     # , return_time_hr=train_return_hr, time_prediction=False
     loss, loss_lp, loss_tp, train_ap, train_mae = train(train_data, return_time_hr=train_return_hr,
