@@ -331,8 +331,8 @@ _, _, val_return_hr = get_return_time(val_data)
 
 # test_reoccur_dict, test_return_ts, test_return_hr = get_return_time(test_data)
 
-h_max = 520
-timestep = 10
+h_max = 100
+timestep = 1
 
 first_batch = []
 
@@ -414,7 +414,7 @@ def time_pred_unitsample(batch_src, batch_pos_dst, batch_z, batch_assoc, symmetr
         return_time_pred = (timestep * 0.5 * (t_sample[:-1] + t_sample[1:])).sum(dim=0)
     return return_time_pred
 
-def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_prediction=False, link_prediction=False):
+def train(dataset, batch_size=200, total_batches=552, return_time_hr=None, time_prediction=False, link_prediction=False):
     dataset_len = dataset.num_events
 
     memory.train()
@@ -625,7 +625,7 @@ all_train_mae, all_train_ap = [], []
 all_val_loss, all_test_loss = [], []
 all_val_ap, all_val_auc, all_test_ap, all_test_auc = [], [], [], []
 all_val_mae, all_test_mae = [], []
-epochs = 100
+epochs = 5
 epochs_no_improve = 0
 patience = 20
 early_stop = True
@@ -633,7 +633,7 @@ min_target = float('inf')
 for epoch in range(1, epochs+1): #51
     # , return_time_hr=train_return_hr, time_prediction=False
     loss, loss_lambda, loss_surv_u, loss_surv_v, train_mae, train_ap = train(train_data, return_time_hr=train_return_hr,
-                                                                             time_prediction=True, link_prediction=True)#, batch_size=5, total_batches=4
+                                                                             time_prediction=False, link_prediction=False)#, batch_size=5, total_batches=4
     all_loss.append(loss)
     all_loss_lambda.append(loss_lambda)
     all_loss_surv_u.append(loss_surv_u)
@@ -677,19 +677,19 @@ plt.title("train link prediction ap")
 plt.subplot(1,3,3)
 plt.plot(np.arange(1, len(all_train_mae)+1), np.array(all_train_mae), 'b')
 plt.title("train time prediction mae")
-fig.savefig('tgnHawkes_wiki_oneSurv_train.png')
+fig.savefig('tgnHawkes_wiki_train.png')
 
 fig2 = plt.figure(figsize=(18, 5))
 plt.subplot(1,3,1)
-plt.plot(np.arange(1, epochs+1), np.array(all_val_loss), 'k', label='total loss')
-plt.title("val loss")
+plt.plot(np.arange(1, len(all_test_loss)+1), np.array(all_test_loss), 'k')
+plt.title("test loss")
 plt.subplot(1,3,2)
-plt.plot(np.arange(1, epochs+1), np.array(all_val_ap), 'r', label='total loss')
-plt.title("val ap")
+plt.plot(np.arange(1, len(all_test_ap)+1), np.array(all_test_ap), 'r')
+plt.title("test ap")
 plt.subplot(1,3,3)
-plt.plot(np.arange(1, epochs+1), np.array(all_val_mae), 'b', label='total loss')
-plt.title("val mae")
-fig2.savefig('tgnHawkes_wiki_oneSurv_val.png')
+plt.plot(np.arange(1, len(all_test_mae)+1), np.array(all_test_mae), 'b')
+plt.title("test mae")
+fig2.savefig('tgnHawkes_wiki_test.png')
 # fig.savefig('tgnHawkes_20events_twoSurv_lr1e-3.png')
 # fig2.savefig('tgnHawkesFirstBatch_allData_twoSurv_lr1e-3.png')
     # val_ap, val_auc = test(val_data, val_return_hr)
