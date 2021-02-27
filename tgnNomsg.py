@@ -38,8 +38,11 @@ from tgnMemoryNoMsg import (LastNeighborLoader, IdentityMessage,
 from SocialEvolutionDataset import SocialEvolutionDataset
 
 parser = argparse.ArgumentParser(description='TGN+DyRep UnitTimeSampling on Social Evolution, No Msg')
-parser.add_argument('--lr', type=float, default=0.0001)
+parser.add_argument('--lr', type=float, default=0.00005)
 parser.add_argument('--dataset', type=str, default='social_initial')
+parser.add_argument('--h_max', type=int, default=5000)
+parser.add_argument('--timestep', type=float, default=1.0)
+parser.add_argument('--num_surv_samples', type=int, default=30)
 parser.add_argument('--epochs', type=int, default=150)
 parser.add_argument('--early_stop', type=bool, default=True)
 parser.add_argument('--patience', type=int, default=30)
@@ -384,7 +387,7 @@ gnn = GraphAttentionEmbedding(
     time_enc=memory.time_enc,
 ).to(device)
 
-num_surv_samples = 30
+num_surv_samples = args.num_surv_samples
 num_time_samples = 5
 
 dyrep = DyRepDecoder(
@@ -415,8 +418,8 @@ _, _, train_return_hr, train_return_hr_true = get_return_time_multitype(train_da
 
 _, _, test_return_hr, test_return_hr_true = get_return_time_multitype(test_data)
 
-h_max = 5000
-timestep = 1
+h_max = args.h_max
+timestep = args.timestep
 
 first_batch = []
 
@@ -694,7 +697,7 @@ def test(inference_data, return_time_hr=None):
         ########## unit sample and time step for time prediction
         # return_time_pred = time_pred_unitsample(src, pos_dst, link_type, z, assoc, symmetric=True)
         num_samples = int(h_max/timestep) + 1
-        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(src)).view(-1)
+        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(src)).view(-1).to(device)
         embeddings_u = z[assoc[src]].repeat(num_samples, 1)
         embeddings_v = z[assoc[pos_dst]].repeat(num_samples, 1)
         # intensity = dyrep.hawkes_intensity(embeddings_u, embeddings_v, link_type.repeat(num_samples), all_td).view(-1, len(src))
@@ -732,7 +735,7 @@ min_target = float('inf')
 for epoch in range(1, epochs+1): #51
     # , return_time_hr=train_return_hr, time_prediction=False
     loss, loss_lambda, loss_surv_u, loss_surv_v, train_mae, train_ap = train(train_data, return_time_hr=train_return_hr,
-                                                                             time_prediction=False, link_prediction=False)#, batch_size=5, total_batches=4
+                                                                             time_prediction=True, link_prediction=True)#, batch_size=5, total_batches=4
     all_loss.append(loss)
     all_loss_lambda.append(loss_lambda)
     all_loss_surv_u.append(loss_surv_u)
