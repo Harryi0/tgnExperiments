@@ -10,7 +10,7 @@
 # While both approaches are correct, together with the authors of the paper we
 # decided to present this version here as it is more realsitic and a better
 # test bed for future methods.
-
+import argparse
 import os.path as osp
 from typing import List
 
@@ -37,10 +37,21 @@ from tgnMemoryNoMsg import (LastNeighborLoader, IdentityMessage,
 
 from SocialEvolutionDataset import SocialEvolutionDataset
 
+parser = argparse.ArgumentParser(description='TGN+DyRep UnitTimeSampling on Social Evolution, No Msg')
+parser.add_argument('--lr', type=float, default=0.0001)
+parser.add_argument('--dataset', type=str, default='social_initial')
+parser.add_argument('--epochs', type=int, default=150)
+parser.add_argument('--early_stop', type=bool, default=True)
+parser.add_argument('--patience', type=int, default=30)
+
+args = parser.parse_args()
+print(args)
+
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 path = osp.join(osp.dirname(osp.realpath(__file__)), '.', 'data')
-dataset = SocialEvolutionDataset(path, name='social_initial')
+dataset = SocialEvolutionDataset(path, name=args.dataset)
 data = dataset[0].to(device)
 
 num_nodes = max(data.src.max(), data.dst.max())+1
@@ -347,8 +358,8 @@ class DyRepDecoder(torch.nn.Module):
         alpha = self.alpha[et]
         w_t = self.w_t[et]
         g += alpha*torch.exp(-w_t*td_norm)
-        g_psi = g / (psi + 1e-7)
-        # g_psi = torch.clamp(g / (psi + 1e-7), -75, 75)  # avoid overflow
+        # g_psi = g / (psi + 1e-7)
+        g_psi = torch.clamp(g / (psi + 1e-7), -75, 75)  # avoid overflow
         # Lambda = self.psi * (torch.log(1 + torch.exp(-g_psi)) + g_psi) + self.alpha*torch.exp(-self.w_t*td_norm)
         Lambda = psi * (torch.log(1 + torch.exp(-g_psi)) + g_psi) #+ alpha*torch.exp(-w_t*td_norm)
         return Lambda
@@ -373,7 +384,7 @@ gnn = GraphAttentionEmbedding(
     time_enc=memory.time_enc,
 ).to(device)
 
-num_surv_samples = 20
+num_surv_samples = 30
 num_time_samples = 5
 
 dyrep = DyRepDecoder(
@@ -383,7 +394,7 @@ dyrep = DyRepDecoder(
 
 optimizer = torch.optim.Adam(
     set(memory.parameters()) | set(gnn.parameters())
-    | set(dyrep.parameters()), lr=0.0001)
+    | set(dyrep.parameters()), lr=args.lr)
 
 # optimizer = torch.optim.Adam(
 #     set(memory.parameters()) | set(gnn.parameters()), lr=0.001)
@@ -550,6 +561,7 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
         # loss += criterion(neg_out, torch.zeros_like(neg_out))
 
         # loss = dyrep(z[assoc[src]], z[assoc[pos_dst]], z[assoc[neg_dst]])
+        ap = 0
         if link_prediction:
             loss_lambda, loss_surv_u, loss_surv_v, cond = dyrep(z, assoc, src, pos_dst, neg_dst_surv,
                                                              neg_src_surv=neg_src_surv, last_update=last_update, cur_time=t,
@@ -680,8 +692,21 @@ def test(inference_data, return_time_hr=None):
         # # return_time_pred = return_time_pred.cpu().numpy() * train_td_hr_std + train_td_hr_mean
         # return_time_pred = return_time_pred.cpu().numpy()
         ########## unit sample and time step for time prediction
-        return_time_pred = time_pred_unitsample(src, pos_dst, link_type, z, assoc, symmetric=True)
-
+        # return_time_pred = time_pred_unitsample(src, pos_dst, link_type, z, assoc, symmetric=True)
+        num_samples = int(h_max/timestep) + 1
+        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(src)).view(-1)
+        embeddings_u = z[assoc[src]].repeat(num_samples, 1)
+        embeddings_v = z[assoc[pos_dst]].repeat(num_samples, 1)
+        # intensity = dyrep.hawkes_intensity(embeddings_u, embeddings_v, link_type.repeat(num_samples), all_td).view(-1, len(src))
+        intensity = 0.5 * (
+                dyrep.hawkes_intensity(embeddings_u, embeddings_v, link_type.repeat(num_samples), all_td)
+                .view(-1, len(src)) +
+                dyrep.hawkes_intensity(embeddings_v, embeddings_u, link_type.repeat(num_samples), all_td)
+                .view(-1, len(src)))
+        integral = torch.cumsum(timestep*intensity, dim=0)
+        density = (intensity * torch.exp(-integral))
+        t_sample = all_td.view(-1, len(src)) * density
+        return_time_pred = (timestep * 0.5 * (t_sample[:-1] + t_sample[1:])).sum(dim=0)
 
         memory.update_state(src, pos_dst, t, None) #link_embedding(link_type).detach()
         neighbor_loader.insert(src, pos_dst)
@@ -699,15 +724,15 @@ all_train_mae, all_train_ap = [], []
 all_val_loss, all_test_loss = [], []
 all_val_ap, all_val_auc, all_test_ap, all_test_auc = [], [], [], []
 all_val_mae, all_test_mae = [], []
-epochs = 100
+epochs = args.epochs
 epochs_no_improve = 0
-patience = 20
-early_stop = True
+patience = args.patience
+early_stop = args.early_stop
 min_target = float('inf')
 for epoch in range(1, epochs+1): #51
     # , return_time_hr=train_return_hr, time_prediction=False
     loss, loss_lambda, loss_surv_u, loss_surv_v, train_mae, train_ap = train(train_data, return_time_hr=train_return_hr,
-                                                                             time_prediction=True, link_prediction=True)#, batch_size=5, total_batches=4
+                                                                             time_prediction=False, link_prediction=False)#, batch_size=5, total_batches=4
     all_loss.append(loss)
     all_loss_lambda.append(loss_lambda)
     all_loss_surv_u.append(loss_surv_u)
@@ -725,9 +750,10 @@ for epoch in range(1, epochs+1): #51
     if early_stop:
         if test_mae < min_target:
             min_target = test_mae
+            epochs_no_improve = 0
         else:
             epochs_no_improve += 1
-            if epochs_no_improve == patience:
+            if epochs_no_improve >= patience:
                 break
 
     # val_ap, val_auc, val_loss, val_mae = test(val_data, val_return_hr)
@@ -751,7 +777,7 @@ plt.title("train link prediction ap")
 plt.subplot(1,3,3)
 plt.plot(np.arange(1,len(all_train_mae)+1), np.array(all_train_mae), 'b')
 plt.title("train time prediction mae")
-fig.savefig('tgn_social_train.png')
+fig.savefig('0record_social/01tgn_social_train.png')
 
 fig2 = plt.figure(figsize=(18, 5))
 plt.subplot(1,3,1)
@@ -763,9 +789,7 @@ plt.title("test ap")
 plt.subplot(1,3,3)
 plt.plot(np.arange(1, len(all_test_mae)+1), np.array(all_test_mae), 'b', label='total loss')
 plt.title("test mae")
-fig2.savefig('tgn_social_test.png')
-
-
+fig2.savefig('0record_social/01tgn_social_test.png')
 
 print(f'Minimum time prediction MAE in the test set: {min_target: .4f}')
 print('Max link prediction ap in the test set: {}'.format(max(all_test_ap)))
