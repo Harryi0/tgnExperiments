@@ -704,9 +704,9 @@ def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_predic
             with torch.no_grad():
                 neg_dst = torch.tensor(random_state.choice(all_neg_nodes, size=src.size(0),
                                                            replace=len(all_neg_nodes) < src.size(0)), device=device)
-                y_pred = torch.cat([lambda_src[torch.arange(batch_size, device=device), pos_dst],
-                                    lambda_src[torch.arange(batch_size, device=device), neg_dst]], dim=0).cpu().detach()
-                y_true = torch.cat([torch.ones(batch_size), torch.zeros(batch_size)], dim=0)
+                y_pred = torch.cat([lambda_src[torch.arange(src.size(0), device=device), pos_dst],
+                                    lambda_src[torch.arange(src.size(0), device=device), neg_dst]], dim=0).cpu().detach()
+                y_true = torch.cat([torch.ones(src.size(0)), torch.zeros(src.size(0))], dim=0)
                 ap = average_precision_score(y_true, y_pred)
                 all_aps.append(ap)
 
@@ -762,7 +762,7 @@ def test(inference_data, return_time_hr, batch_size=200, total_batches=53):
     for batch_id, batch in enumerate(tqdm(inference_data.seq_batches(batch_size=batch_size), total=total_batches)):
         src, pos_dst, t, link_type = batch.src, batch.dst, batch.t, batch.y
 
-        all_neg_nodes = np.delete(np.arange(num_nodes), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
+        all_neg_nodes = np.delete(np.arange(num_nodes.cpu().numpy()), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
 
         ####### include all dst nodes
         # n_id = torch.cat([src, pos_dst, neg_dst]).unique()
@@ -816,9 +816,9 @@ def test(inference_data, return_time_hr, batch_size=200, total_batches=53):
         # Link Prediction
         neg_dst = torch.tensor(random_state.choice(all_neg_nodes, size=src.size(0),
                                                    replace=len(all_neg_nodes) < src.size(0)), device=device)
-        y_pred = torch.cat([lambda_src[torch.arange(batch_size, device=device), pos_dst],
-                            lambda_src[torch.arange(batch_size, device=device), neg_dst]], dim=0).cpu().detach()
-        y_true = torch.cat([torch.ones(batch_size), torch.zeros(batch_size)], dim=0)
+        y_pred = torch.cat([lambda_src[torch.arange(src.size(0), device=device), pos_dst],
+                            lambda_src[torch.arange(src.size(0), device=device), neg_dst]], dim=0).cpu().detach()
+        y_true = torch.cat([torch.ones(src.size(0)), torch.zeros(src.size(0))], dim=0)
         ap = average_precision_score(y_true, y_pred)
         all_aps.append(ap)
 
