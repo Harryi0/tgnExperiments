@@ -556,7 +556,8 @@ num_time_samples = 5
 
 decoder = Decoder_GHNN(
     embedding_dim=embedding_dim,
-    num_nodes=num_nodes
+    num_nodes=num_nodes,
+    device=device
 ).to(device)
 
 # optimizer = torch.optim.Adam(
@@ -729,8 +730,8 @@ def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_predic
         total_lp_loss += float(lp_loss) * batch.num_events
         total_tp_loss += float(tp_loss) * batch.num_events
 
-        # if batch_id > 10:
-        #     break
+        if batch_id > 10:
+            break
 
     return total_loss/dataset_len, total_lp_loss/dataset_len, \
            total_tp_loss/dataset_len, float(torch.tensor(all_aps).mean()), total_mae/dataset_len

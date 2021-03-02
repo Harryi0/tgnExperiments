@@ -40,10 +40,11 @@ class cLSTMCell(torch.nn.Module):
 
 
 class cLSTM(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_nodes=None):
+    def __init__(self, input_dim, hidden_dim, device, num_nodes=None):
         super(cLSTM, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.deivce = device
         self.clstm = cLSTMCell(2*input_dim, hidden_dim)
 
         # self.register_buffer('hidden_memory', torch.empty(num_nodes, hidden_dim))
@@ -61,9 +62,9 @@ class cLSTM(torch.nn.Module):
         zeros(self.cell_target_memory)
 
     def initialization(self, batch_size):
-        h0 = torch.zeros((batch_size, self.hidden_dim))
-        c0 = torch.zeros((batch_size, self.hidden_dim))
-        c_target0 = torch.zeros((batch_size, self.hidden_dim))
+        h0 = torch.zeros((batch_size, self.hidden_dim), device=self.device)
+        c0 = torch.zeros((batch_size, self.hidden_dim), device=self.device)
+        c_target0 = torch.zeros((batch_size, self.hidden_dim), device=self.device)
         return h0, c0, c_target0
 
     def forward(self, x, n_id, t, last_t, x_neighbor=None, x_type=None):
