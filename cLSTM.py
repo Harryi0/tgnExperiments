@@ -44,7 +44,7 @@ class cLSTM(torch.nn.Module):
         super(cLSTM, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.deivce = device
+        self.device = device
         self.clstm = cLSTMCell(2*input_dim, hidden_dim)
 
         # self.register_buffer('hidden_memory', torch.empty(num_nodes, hidden_dim))
