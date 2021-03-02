@@ -543,8 +543,12 @@ gnn = GraphAttentionEmbedding(
     time_enc=memory.time_enc,
 ).to(device)
 
-cLSTM_src = cLSTM(memory_dim, memory_dim).to(device)
-cLSTM_dst = cLSTM(memory_dim, memory_dim).to(device)
+cLSTM_src = cLSTM(input_dim=memory_dim,
+                  hidden_dim=embedding_dim,
+                  device=device).to(device)
+cLSTM_dst = cLSTM(input_dim=memory_dim,
+                  hidden_dim=embedding_dim,
+                  device=device).to(device)
 
 num_surv_samples = args.num_surv_samples
 num_time_samples = 5
@@ -556,8 +560,7 @@ num_time_samples = 5
 
 decoder = Decoder_GHNN(
     embedding_dim=embedding_dim,
-    num_nodes=num_nodes,
-    device=device
+    num_nodes=num_nodes
 ).to(device)
 
 # optimizer = torch.optim.Adam(
