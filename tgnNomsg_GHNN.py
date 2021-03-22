@@ -401,6 +401,7 @@ class Decoder(torch.nn.Module):
             if isinstance(module, Linear):
                 module.reset_parameters()
 
+    # dyrep(z, assoc, src, pos_dst, neg_dst, last_update, t, link_type)
     def forward(self, all_embeddings, assoc, src, pos_dst, neg_dst, last_update, cur_time, et):
 
         z_src, z_dst = all_embeddings[assoc[src]], all_embeddings[assoc[pos_dst]]
@@ -430,7 +431,7 @@ class Decoder(torch.nn.Module):
 
 
 
-        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(src)).view(-1)
+        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(src)).view(-1).to(device)
 
         embeddings_u_tp = z_src.repeat(num_samples, 1)
         embeddings_v_tp = z_dst.repeat(num_samples, 1)
@@ -627,7 +628,7 @@ def time_pred(batch_src, batch_pos_dst, batch_t, batch_link_type, batch_last_upd
 def time_pred_unitsample(batch_src, batch_pos_dst, batch_link_type, batch_z, batch_assoc, symmetric=True):
     with torch.no_grad():
         num_samples = int(h_max / timestep) + 1
-        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(batch_src)).view(-1)
+        all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(batch_src)).view(-1).to(device)
 
         embeddings_u = batch_z[batch_assoc[batch_src]].repeat(num_samples, 1)
         embeddings_v = batch_z[batch_assoc[batch_pos_dst]].repeat(num_samples, 1)
@@ -673,7 +674,7 @@ def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_predic
 
         src, pos_dst, t, link_type = batch.src, batch.dst, batch.t, batch.y
 
-        all_neg_nodes = np.delete(np.arange(num_nodes), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
+        all_neg_nodes = np.delete(np.arange(num_nodes.cpu().numpy()), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
 
         # all_neg_surv = torch.tensor(random_state.choice(all_neg_nodes, size=src.size(0)*num_surv_samples*2,
         #                                         replace=len(all_neg_nodes) < src.size(0)*num_surv_samples*2),
@@ -754,8 +755,8 @@ def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_predic
         total_lp_loss += float(lp_loss) * batch.num_events
         total_tp_loss += float(tp_loss) * batch.num_events
 
-        if batch_id > 20:
-            break
+        # if batch_id > 10:
+        #     break
 
     return total_loss/dataset_len, total_lp_loss/dataset_len, \
            total_tp_loss/dataset_len, float(torch.tensor(all_aps).mean()), total_mae/dataset_len
@@ -786,8 +787,8 @@ def test(inference_data, return_time_hr, batch_size=200, total_batches=53):
                                                 replace=len(all_neg_nodes) < src.size(0)),
                                device=device)
         ####### include all dst nodes
-        n_id = torch.cat([src, pos_dst, neg_dst]).unique()
-        # n_id = torch.arange(num_nodes)
+        # n_id = torch.cat([src, pos_dst, neg_dst]).unique()
+        n_id = torch.arange(num_nodes, device=device)
 
         n_id, edge_index, e_id = neighbor_loader(n_id)
         assoc[n_id] = torch.arange(n_id.size(0), device=device)
@@ -902,6 +903,10 @@ plt.subplot(1,3,3)
 plt.plot(np.arange(1, len(all_test_mae)+1), np.array(all_test_mae), 'b', label='total loss')
 plt.title("test mae")
 fig2.savefig('tgnNoMsg_GHNN_test.png')
+
+
+print(f'Minimum time prediction MAE in the test set: {min_test_mae: .4f}')
+print('Max link prediction ap in the test set: {}'.format(max(all_test_ap)))
 # fig.savefig('tgnHawkes_20events_twoSurv_lr1e-3.png')
 # fig2.savefig('tgnHawkesFirstBatch_allData_twoSurv_lr1e-3.png')
     # val_ap, val_auc = test(val_data, val_return_hr)

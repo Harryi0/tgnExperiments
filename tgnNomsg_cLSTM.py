@@ -40,14 +40,16 @@ from cLSTM import cLSTM
 from SocialEvolutionDataset import SocialEvolutionDataset
 
 parser = argparse.ArgumentParser(description='TGN+DyRep UnitTimeSampling on Social Evolution, No Msg')
-parser.add_argument('--lr', type=float, default=0.00005)
-parser.add_argument('--dataset', type=str, default='social_initial')
+parser.add_argument('--lr', type=float, default=0.001)
+parser.add_argument('--dataset', type=str, default='social')
 parser.add_argument('--h_max', type=int, default=5000)
 parser.add_argument('--timestep', type=float, default=1.0)
 parser.add_argument('--num_surv_samples', type=int, default=30)
 parser.add_argument('--epochs', type=int, default=150)
 parser.add_argument('--early_stop', type=bool, default=True)
 parser.add_argument('--patience', type=int, default=30)
+parser.add_argument('--use_cLSTM', type=bool, default=False)
+parser.add_argument('--time_type', type=str, default='ts', choices=['ts', 'hr'])
 
 args = parser.parse_args()
 print(args)
@@ -62,8 +64,8 @@ data = dataset[0].to(device)
 num_nodes = max(data.src.max(), data.dst.max())+1
 num_links = len(data.y.unique())
 
-train_len = 44106
-# train_len = 43834
+# train_len = 44106
+train_len = 43834
 # only comm 43469
 
 # Train len 43834, test len 10535
@@ -312,9 +314,10 @@ class DyRepDecoder(torch.nn.Module):
         z_u = z_u.view(-1, self.embed_dim)
         z_v = z_v.view(-1, self.embed_dim)
         et = (et_uv > 0).long()
-        # td_norm = td
-        td_norm = td / train_td_max
-        # td_norm = (td - train_td_mean) / train_td_std
+        if args.time_type == 'hr':
+            td_norm = td / train_td_hr_max
+        else:
+            td_norm = td / train_td_max
         if symmetric:
             z_uv = torch.cat((z_u, z_v), dim=1)
             z_vu = torch.cat((z_v, z_u), dim=1)
@@ -412,13 +415,14 @@ class Decoder(torch.nn.Module):
         return lambda_src, lambda_dst, return_time_pred
         # return lambda_pos, lambda_neg, return_time_pred
 
-    def hawkes_intensity(self, z_u, z_v, et_uv, td, symmetric=False):
+    def hawkes_intensity(self, z_u, z_v, et_uv, td, symmetric=True):
         z_u = z_u.view(-1, self.embed_dim)
         z_v = z_v.view(-1, self.embed_dim)
         et = (et_uv > 0).long()
-        # td_norm = td
-        td_norm = td / train_td_max
-        # td_norm = (td - train_td_mean) / train_td_std
+        if args.time_type == 'hr':
+            td_norm = td / train_td_hr_max
+        else:
+            td_norm = td / train_td_max
         if symmetric:
             z_uv = torch.cat((z_u, z_v), dim=1)
             z_vu = torch.cat((z_v, z_u), dim=1)
@@ -506,7 +510,6 @@ class Decoder_GHNN(torch.nn.Module):
         # return lambda_pos, lambda_neg, return_time_pred
 
     def compute_intensity(self, z_u, h, z_v, et_uv, z_k=None):
-        # TODO: try Dropout for the concatenation
         et = (et_uv > 0).long()
         if z_k is None:
             z_cat = torch.cat((z_u, h), dim=-1)
@@ -563,13 +566,16 @@ decoder = Decoder_GHNN(
     num_nodes=num_nodes
 ).to(device)
 
-# optimizer = torch.optim.Adam(
-#     set(memory.parameters()) | set(gnn.parameters())
-#     | set(decoder.parameters()), lr=args.lr)
 
-optimizer = torch.optim.Adam(
-    set(memory.parameters()) | set(gnn.parameters()) | set(decoder.parameters())
-    | set(cLSTM_src.parameters()) | set(cLSTM_dst.parameters()), lr=args.lr)
+
+if args.use_cLSTM:
+    optimizer = torch.optim.Adam(
+        set(memory.parameters()) | set(gnn.parameters()) | set(decoder.parameters())
+        | set(cLSTM_src.parameters()) | set(cLSTM_dst.parameters()), lr=args.lr)
+else:
+    optimizer = torch.optim.Adam(
+        set(memory.parameters()) | set(gnn.parameters())
+        | set(decoder.parameters()), lr=args.lr)
 
 link_criterion = torch.nn.BCEWithLogitsLoss()
 link_criterion_multi = torch.nn.CrossEntropyLoss()
@@ -595,7 +601,7 @@ num_samples = int(h_max / timestep) + 1
 
 first_batch = []
 
-tp_scale = 1e-6
+tp_scale = 2e-6
 
 def compute_hidden_tp(c, c_target, gate_o, delta, all_td):
     c_tp = c.unsqueeze(0).repeat(num_samples, 1, 1)
@@ -633,7 +639,10 @@ def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_predic
     for batch_id, batch in enumerate(tqdm(dataset.seq_batches(batch_size=batch_size), total=total_batches)):
         optimizer.zero_grad()
 
-        src, pos_dst, t, link_type = batch.src, batch.dst, batch.t, batch.y
+        if args.time_type=='hr':
+            src, pos_dst, t, link_type = batch.src, batch.dst, batch.dt_hr, batch.y
+        else:
+            src, pos_dst, t, link_type = batch.src, batch.dst, batch.t, batch.y
 
         all_neg_nodes = np.delete(np.arange(num_nodes.cpu().numpy()), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
 
@@ -680,11 +689,10 @@ def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_predic
         lambda_src = lambda_src.view(-1, num_nodes)
         lambda_dst = lambda_dst.view(-1, num_nodes)
 
-        lp_loss = link_criterion_multi(lambda_src, pos_dst)
-        lp_loss += link_criterion_multi(lambda_dst, src)
+        # lp_loss = link_criterion_multi(lambda_src, pos_dst)
+        # lp_loss += link_criterion_multi(lambda_dst, src)
 
-        # lp_loss = link_criterion(cond_pos, torch.ones_like(cond_pos))
-        # lp_loss += link_criterion(cond_neg, torch.zeros_like(cond_neg))
+        lp_loss = 0.5*(link_criterion_multi(lambda_src, pos_dst) + link_criterion_multi(lambda_dst, src))
 
 
         batch_return_time = return_time_hr[batch_id * batch_size:(batch_id * batch_size + batch.num_events)]
@@ -733,8 +741,8 @@ def train(dataset,return_time_hr, batch_size=200, total_batches=220, time_predic
         total_lp_loss += float(lp_loss) * batch.num_events
         total_tp_loss += float(tp_loss) * batch.num_events
 
-        if batch_id > 10:
-            break
+        # if batch_id > 10:
+        #     break
 
     return total_loss/dataset_len, total_lp_loss/dataset_len, \
            total_tp_loss/dataset_len, float(torch.tensor(all_aps).mean()), total_mae/dataset_len
@@ -760,7 +768,10 @@ def test(inference_data, return_time_hr, batch_size=200, total_batches=53):
     ap = 0
     all_aps = []
     for batch_id, batch in enumerate(tqdm(inference_data.seq_batches(batch_size=batch_size), total=total_batches)):
-        src, pos_dst, t, link_type = batch.src, batch.dst, batch.t, batch.y
+        if args.time_type=='hr':
+            src, pos_dst, t, link_type = batch.src, batch.dst, batch.dt_hr, batch.y
+        else:
+            src, pos_dst, t, link_type = batch.src, batch.dst, batch.t, batch.y
 
         all_neg_nodes = np.delete(np.arange(num_nodes.cpu().numpy()), np.concatenate([pos_dst.cpu().numpy(), src.cpu().numpy()]))
 
@@ -778,7 +789,7 @@ def test(inference_data, return_time_hr, batch_size=200, total_batches=53):
         neighbor_memory[labels.unique()] /= labels_count.float().unsqueeze(1)
         # forward(self, x, n_id, t, last_t, x_neighbor=None, x_type=None)
         h_src, c_src, c_target_src, gate_o_src, delta_src = cLSTM_src(x=z_memory[assoc[src]], n_id=src, t=t,
-                                                                      last_t=last_update[assoc[src]],
+                                                                      last_t=last_update[assoc[src]], max_dt=train_td_max,
                                                                       x_neighbor=neighbor_memory[assoc[src]])
         h_dst, c_dst, c_target_dst, gate_o_dst, delta_dst = cLSTM_dst(x=z_memory[assoc[pos_dst]], n_id=pos_dst, t=t,
                                                                       last_t=last_update[assoc[pos_dst]],
@@ -798,8 +809,10 @@ def test(inference_data, return_time_hr, batch_size=200, total_batches=53):
         lambda_src = lambda_src.view(-1, num_nodes)
         lambda_dst = lambda_dst.view(-1, num_nodes)
 
-        lp_loss = link_criterion_multi(lambda_src, pos_dst)
-        lp_loss += link_criterion_multi(lambda_dst, src)
+        # lp_loss = link_criterion_multi(lambda_src, pos_dst)
+        # lp_loss += link_criterion_multi(lambda_dst, src)
+
+        lp_loss = 0.5 * (link_criterion_multi(lambda_src, pos_dst) + link_criterion_multi(lambda_dst, src))
 
         # lambda_pos, lambda_neg, tp = dyrep(z, assoc, src, pos_dst, neg_dst, last_update, t, link_type)
         # lp_loss = link_criterion(lambda_pos, torch.ones_like(lambda_pos))
@@ -850,7 +863,7 @@ test_return_hr = torch.tensor(test_return_hr, device=device)
 for epoch in range(1, epochs+1): #51
     # , return_time_hr=train_return_hr, time_prediction=False
     loss, loss_lp, loss_tp, train_ap, train_mae = train(train_data, return_time_hr=train_return_hr,
-                                                        time_prediction=True, link_prediction=True)#, batch_size=5, total_batches=4
+                                                        time_prediction=False, link_prediction=False)#, batch_size=5, total_batches=4
     all_loss.append(loss)
     all_loss_lp.append(loss_lp)
     all_loss_tp.append(loss_tp)
