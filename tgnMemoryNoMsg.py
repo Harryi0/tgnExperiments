@@ -34,7 +34,7 @@ class TGNMemory(torch.nn.Module):
     """
     def __init__(self, num_nodes: int, raw_msg_dim: int, memory_dim: int,
                  time_dim: int, message_module: Callable,
-                 aggregator_module: Callable):
+                 aggregator_module: Callable, initial_ts):
         super(TGNMemory, self).__init__()
 
         self.num_nodes = num_nodes
@@ -42,6 +42,7 @@ class TGNMemory(torch.nn.Module):
         self.memory_dim = memory_dim
         self.time_dim = time_dim
         self.contain_raw_msg = False
+        self.initial_ts = initial_ts
 
         self.msg_s_module = message_module
         self.msg_d_module = copy.deepcopy(message_module)
@@ -51,7 +52,7 @@ class TGNMemory(torch.nn.Module):
 
         self.register_buffer('memory', torch.empty(num_nodes, memory_dim))
         # last_update = torch.empty(self.num_nodes, dtype=torch.long)
-        last_update = torch.ones(self.num_nodes, dtype=torch.long)
+        last_update = torch.ones(self.num_nodes, dtype=torch.float)
         self.register_buffer('last_update', last_update)
         self.register_buffer('__assoc__',
                              torch.empty(num_nodes, dtype=torch.long))
@@ -76,6 +77,7 @@ class TGNMemory(torch.nn.Module):
         """Resets the memory to its initial state."""
         zeros(self.memory)
         zeros(self.last_update)
+        # self.last_update += self.initial_ts
         self.__reset_message_store__()
 
     def detach(self):
