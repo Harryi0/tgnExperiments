@@ -548,13 +548,6 @@ def train(dataset, batch_size=200, total_batches=220, return_time_hr=None, time_
         z_memory, last_update = memory(n_id)
         z = gnn(z_memory, last_update, edge_index, data.t[e_id], None) #link_embedding(data.y[e_id]).detach()
 
-        # pos_out = link_pred(z[assoc[src]], z[assoc[pos_dst]])
-        # neg_out = link_pred(z[assoc[src]], z[assoc[neg_dst]])
-        #
-        # loss = criterion(pos_out, torch.ones_like(pos_out))
-        # loss += criterion(neg_out, torch.zeros_like(neg_out))
-
-        # loss = dyrep(z[assoc[src]], z[assoc[pos_dst]], z[assoc[neg_dst]])
         ap = 0
         if link_prediction:
             loss_lambda, loss_surv_u, loss_surv_v, cond = dyrep(z, assoc, src, pos_dst, neg_dst_surv,
