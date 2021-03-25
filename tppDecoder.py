@@ -148,19 +148,25 @@ class DyRepDecoder(torch.nn.Module):
 
 
 class DecoderTP(torch.nn.Module):
-    def __init__(self, embedding_dim, num_surv_samples, train_td_hr_max, train_td_max, num_rel=2, time_type='hr', device='cpu'):
+    def __init__(self, embedding_dim, num_surv_samples, train_td_hr_max, train_td_max,
+                 train_td_hr_mean=None, train_td_hr_std=None, num_rel=2, time_type='hr', device='cpu'):
         super(DecoderTP, self).__init__()
+        self.unit_sampling = True
         self.embed_dim = embedding_dim
         self.num_surv_samples = num_surv_samples
         self.train_td_hr_max = train_td_hr_max
+
         self.train_td_max = train_td_max
+        self.train_td_hr_mean = train_td_hr_mean
+        self.train_td_hr_std = train_td_hr_std
         self.time_type = time_type
         self.device=device
         self.num_rel = num_rel
         self.omega = ModuleList([Linear(in_features=2*self.embed_dim, out_features=1) for _ in range(num_rel)])
 
         self.psi = Parameter(0.5*torch.ones(num_rel))
-        self.alpha = Parameter(torch.rand(num_rel))
+        # self.alpha = Parameter(torch.rand(num_rel))
+        self.alpha = Parameter(-0.1*torch.ones(num_rel))
         self.w_t = Parameter(torch.rand(num_rel))
         self.reset_parameters()
 
@@ -171,28 +177,47 @@ class DecoderTP(torch.nn.Module):
                 module.reset_parameters()
 
     def forward(self, all_embeddings, assoc, src, pos_dst, last_update, cur_time,
-                u_non_embeddings, v_non_embeddings, neg_dst=None, et=None):
+                u_non_embeddings, v_non_embeddings, neg_dst=None, et=None, last_time_pos=None):
 
         z_src, z_dst = all_embeddings[assoc[src]], all_embeddings[assoc[pos_dst]]
 
-        last_time_pos = torch.cat((last_update[assoc[src]].view(-1,1),
-                                   last_update[assoc[pos_dst]].view(-1,1)), dim=1).max(-1)[0]
-        td_pos = cur_time - last_time_pos
+        if last_time_pos is None:
+            last_time_pos = torch.cat((last_update[assoc[src]].view(-1,1),
+                                       last_update[assoc[pos_dst]].view(-1,1)), dim=1).max(-1)[0]
+            td_pos = cur_time - last_time_pos
+        else:
+            td_pos = cur_time - last_time_pos
 
-        td_surv_step = td_pos / (self.num_surv_samples-1)
-        td_surv_base = torch.linspace(0, self.num_surv_samples-1, self.num_surv_samples).unsqueeze(1) \
-            .repeat(1, len(src)).to(self.device)
-        td_surv = (td_surv_base * td_surv_step).view(-1)
+        if self.unit_sampling:
+            td_surv_step = td_pos / (self.num_surv_samples-1)
+            td_surv_base = torch.linspace(0, self.num_surv_samples-1, self.num_surv_samples).unsqueeze(1) \
+                .repeat(1, len(src)).to(self.device)
+            td_surv = (td_surv_base * td_surv_step)
+        else:
+            td_surv_step = torch.rand((self.num_surv_samples, len(src))).to(self.device)
+            td_surv = td_surv_step*(td_pos.view(1,-1))
 
         if et is not None:
-            lambda_uv = self.hawkes_intensity(z_src, z_dst, et, td_pos)
-            lambda_surv = self.hawkes_intensity(u_non_embeddings, v_non_embeddings, et.repeat(self.num_surv_samples),
-                                                td_surv).view(-1, len(src))
-        else:
-            lambda_uv = self.hawkes_intensity_singleType(z_src, z_dst, td_pos)
-            lambda_surv = self.hawkes_intensity_singleType(u_non_embeddings, v_non_embeddings, td_surv).view(-1, len(src))
+            # lambda_uv = self.hawkes_intensity(z_src, z_dst, et, td_pos)
+            # lambda_surv = self.hawkes_intensity(u_non_embeddings, v_non_embeddings, et.repeat(self.num_surv_samples),
+            #                                     td_surv).view(-1, len(src))
+            temporal_pos = (cur_time - last_time_pos) / (last_time_pos + 1)
+            temporal_surv = (td_surv / (last_time_pos + 1).unsqueeze(0)).view(-1)
+            lambda_uv = self.THP_intensity(z_src, z_dst, et, temporal_pos)
+            lambda_surv = self.THP_intensity(u_non_embeddings, v_non_embeddings, et.repeat(self.num_surv_samples),
+                                                temporal_surv).view(-1, len(src))
 
-        integral = torch.sum(td_surv_step.view(1, -1) * lambda_surv, dim=0)
+        else:
+            temporal_pos = (cur_time - last_time_pos) / (last_time_pos + 1)
+            temporal_surv = (td_surv / (last_time_pos + 1).unsqueeze(0)).view(-1)
+            lambda_uv = self.THP_intensity_singleType(z_src, z_dst, temporal_pos)
+            lambda_surv = self.THP_intensity_singleType(u_non_embeddings, v_non_embeddings, temporal_surv).view(-1, len(src))
+
+        if self.unit_sampling:
+            integral = torch.sum(td_surv_step.view(1, -1) * lambda_surv, dim=0)
+        else:
+            integral = torch.sum(td_surv_step*lambda_surv, dim=0) / self.num_surv_samples
+
         loss_lambda = -torch.sum(torch.log(lambda_uv + 1e-7))
         loss_surv = torch.sum(integral)
 
@@ -203,18 +228,21 @@ class DecoderTP(torch.nn.Module):
                 last_time_neg = torch.cat((last_update[assoc[src]].view(-1,1), last_update[assoc[neg_dst]].view(-1,1)), dim=1).max(-1)[0]
                 td_neg = cur_time - last_time_neg
                 if et is not None:
-                    lambda_uv_neg = self.hawkes_intensity(z_src, z_neg_dst, et, td_neg)
+                    # lambda_uv_neg = self.hawkes_intensity(z_src, z_neg_dst, et, td_neg)
+                    temporal_neg = td_neg / (last_time_neg + 1)
+                    lambda_uv_neg = self.THP_intensity(z_src, z_neg_dst, et, temporal_neg)
                 else:
-                    lambda_uv_neg = self.hawkes_intensity_singleType(z_src, z_neg_dst, td_neg)
-                # surv = torch.exp(-integral)
-                # assert len(z_src) == len(surv)
-                # cond_pos = lambda_uv * surv
-                # cond_neg = lambda_uv_neg * surv
-                # cond_density = [cond_pos, cond_neg]
-                cond_density = [lambda_uv, lambda_uv_neg]
+                    temporal_neg = td_neg / (last_time_neg + 1)
+                    lambda_uv_neg = self.THP_intensity_singleType(z_src, z_neg_dst, temporal_neg)
+                surv = torch.exp(-integral)
+                assert len(z_src) == len(surv)
+                cond_pos = lambda_uv * surv
+                cond_neg = lambda_uv_neg * surv
+                cond_density = [cond_pos, cond_neg]
+                # cond_density = [lambda_uv, lambda_uv_neg]
         return loss_lambda/len(z_src), loss_surv/len(z_src), cond_density
 
-    def hawkes_intensity_singleType(self, z_u, z_v, td, symmetric=False):
+    def hawkes_intensity_singleType(self, z_u, z_v, td, symmetric=True):
         z_u = z_u.view(-1, self.embed_dim)
         z_v = z_v.view(-1, self.embed_dim)
         if self.time_type == 'hr':
@@ -241,6 +269,7 @@ class DecoderTP(torch.nn.Module):
         et = (et_uv > 0).long()
         if self.time_type == 'hr':
             td_norm = td / self.train_td_hr_max
+            # td_norm = (td - self.train_td_hr_mean) / self.train_td_hr_std
         else:
             td_norm = td / self.train_td_max
             # td_norm = (td - train_td_mean) / train_td_std
@@ -269,9 +298,61 @@ class DecoderTP(torch.nn.Module):
         psi = self.psi[et]
         alpha = self.alpha[et]
         w_t = self.w_t[et]
-        g += alpha*torch.exp(-w_t*td_norm)
+        # g += alpha*torch.exp(-w_t*td_norm)
         # g_psi = g / (psi + 1e-7)
         g_psi = torch.clamp(g / (psi + 1e-7), -75, 75)  # avoid overflow
         # Lambda = self.psi * (torch.log(1 + torch.exp(-g_psi)) + g_psi) + self.alpha*torch.exp(-self.w_t*td_norm)
         Lambda = psi * (torch.log(1 + torch.exp(-g_psi)) + g_psi) #+ alpha*torch.exp(-w_t*td_norm)
+        return Lambda
+
+    def THP_intensity(self, z_u, z_v, et_uv, temporal, symmetric=True):
+        z_u = z_u.view(-1, self.embed_dim)
+        z_v = z_v.view(-1, self.embed_dim)
+        et = (et_uv > 0).long()
+
+        if symmetric:
+            z_uv = torch.cat((z_u, z_v), dim=1)
+            z_vu = torch.cat((z_v, z_u), dim=1)
+            g_uv = z_uv.new_zeros(len(z_uv))
+            g_vu = z_vu.new_zeros(len(z_vu))
+            for k in range(2):
+                idx = (et == k)
+                if torch.sum(idx) > 0:
+                    g_uv[idx] = self.omega[k](z_uv).flatten()[idx]
+                    g_vu[idx] = self.omega[k](z_vu).flatten()[idx]
+                    # g_uv = self.omega(torch.cat((z_u, z_v), dim=1)).flatten()
+            # g_vu = self.omega(torch.cat((z_v, z_u), dim=1)).flatten()
+            g = 0.5*(g_uv + g_vu)
+        else:
+            z_cat = torch.cat((z_u, z_v), dim=1)
+            g = z_cat.new_zeros(len(z_cat))
+            for k in range(2):
+                idx = (et == k)
+                if torch.sum(idx) > 0:
+                    g[idx] = self.omega[k](z_cat).flatten()[idx]
+
+            # g = self.omega(torch.cat((z_u, z_v), dim=1)).flatten()
+        psi = self.psi[et]
+        alpha = self.alpha[et]
+        g += alpha*temporal
+        # g_psi = g / (psi + 1e-7)
+        g_psi = torch.clamp(g / (psi + 1e-7), -75, 75)  # avoid overflow
+        # Lambda = self.psi * (torch.log(1 + torch.exp(-g_psi)) + g_psi) + self.alpha*torch.exp(-self.w_t*td_norm)
+        Lambda = psi * (torch.log(1 + torch.exp(-g_psi)) + g_psi) #+ alpha*torch.exp(-w_t*td_norm)
+        return Lambda
+
+    def THP_intensity_singleType(self, z_u, z_v, temporal, symmetric=True):
+        z_u = z_u.view(-1, self.embed_dim)
+        z_v = z_v.view(-1, self.embed_dim)
+        if symmetric:
+            g_uv = self.omega[0](torch.cat((z_u, z_v), dim=1)).flatten()
+            g_vu = self.omega[0](torch.cat((z_v, z_u), dim=1)).flatten()
+            g = 0.5*(g_uv + g_vu)
+        else:
+            g = self.omega[0](torch.cat((z_u, z_v), dim=1)).flatten()
+        # g_psi = g / (self.psi + 1e-7)
+        g = g + self.alpha*temporal
+        g_psi = torch.clamp(g / (self.psi + 1e-7), -75, 75)  # avoid overflow
+        # Lambda = self.psi * torch.log(1 + torch.exp(g_psi))
+        Lambda = self.psi * (torch.log(1 + torch.exp(-g_psi)) + g_psi) # + self.alpha*torch.exp(-self.w_t*td_norm)
         return Lambda
