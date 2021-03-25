@@ -36,7 +36,7 @@ from torch_geometric.nn.models.tgn import (LastNeighborLoader, IdentityMessage,
 from tppDecoder import DecoderTP
 
 parser = argparse.ArgumentParser(description='TGN+DyRep UnitTimeSampling on wiki data')
-parser.add_argument('--lr', type=float, default=0.0001)
+parser.add_argument('--lr', type=float, default=0.001)
 parser.add_argument('--dataset', type=str, default='wikipedia', choices=['wikipedia', 'reddit'])
 parser.add_argument('--h_max', type=int, default=500)
 parser.add_argument('--timestep', type=float, default=10.0)
@@ -124,6 +124,8 @@ def get_return_time(dataset):
     end_time = dataset_t[-1]+1
     reoccur_time_ts = np.zeros(len(dataset_src))
     reoccur_time_hr = np.zeros(len(dataset_src))
+    last_time_ts = np.zeros(len(dataset_src)) + dataset_t[0]
+    last_time_hr = np.zeros(len(dataset_src))
     for idx in range(len(dataset_src)):
         n1, n2, t = dataset_src[idx], dataset_dst[idx], dataset_t[idx]
         occ = reoccur_dict[(n1,n2)]
@@ -135,8 +137,12 @@ def get_return_time(dataset):
             reoccur_time_ts[idx] = occ[occ.index(t) + 1]
             reoccur_time = datetime.fromtimestamp(int(reoccur_time_ts[idx])) - datetime.fromtimestamp(int(t))
             reoccur_time_hr[idx] = round((reoccur_time.days*24 + reoccur_time.seconds/3600),3)
+        if len(occ) > 1 and t != occ[0]:
+            last_time_ts[idx] = occ[occ.index(t) - 1]
+            last_time = datetime.fromtimestamp(int(last_time_ts[idx])) - datetime.fromtimestamp(int(dataset_t[0]))
+            last_time_hr[idx] = round((last_time.days * 24 + last_time.seconds / 3600), 3)
 
-    return reoccur_dict, reoccur_time_ts, reoccur_time_hr
+    return reoccur_dict, reoccur_time_ts, reoccur_time_hr, last_time_ts, last_time_hr
 
 class GraphAttentionEmbedding(torch.nn.Module):
     def __init__(self, in_channels, out_channels, msg_dim, time_enc):
@@ -345,6 +351,7 @@ decoder = DecoderTP(
     train_td_hr_max=train_td_hr_max,
     train_td_max=train_td_max,
     num_rel=1,
+    time_type=args.time_type,
     device=device
 ).to(device)
 
@@ -362,9 +369,11 @@ assoc = torch.empty(data.num_nodes, dtype=torch.long, device=device)
 
 
 # Get return time for val and test dataset
-_, _, train_return_hr = get_return_time(train_data)
+_, _, train_return_hr,_,_ = get_return_time(train_data)
 
-_, _, val_return_hr = get_return_time(val_data)
+_, _, val_return_hr,_,_ = get_return_time(val_data)
+
+_, _, _, all_last_ts, all_last_hr = get_return_time(data)
 
 # test_reoccur_dict, test_return_ts, test_return_hr = get_return_time(test_data)
 
@@ -374,7 +383,7 @@ timestep = args.timestep
 first_batch = []
 
 
-def time_pred_unitsample(batch_src, batch_pos_dst, batch_z, batch_assoc, symmetric=True):
+def time_pred_unitsample(batch_src, batch_pos_dst, batch_z, batch_assoc, batch_t, symmetric=True):
     with torch.no_grad():
         num_samples = int(h_max / timestep) + 1
         all_td = torch.linspace(0, h_max, num_samples).unsqueeze(1).repeat(1, len(batch_src)).view(-1).to(device)
@@ -383,8 +392,9 @@ def time_pred_unitsample(batch_src, batch_pos_dst, batch_z, batch_assoc, symmetr
         embeddings_v = batch_z[batch_assoc[batch_pos_dst]].repeat(num_samples, 1)
 
         if symmetric:
-            intensity = 0.5 * ( decoder.hawkes_intensity_singleType(embeddings_u, embeddings_v, all_td).view(-1, len(batch_src)) +
-                                decoder.hawkes_intensity_singleType(embeddings_v, embeddings_u, all_td).view(-1, len(batch_src)) )
+            temporal_all_td = (all_td.view(-1, len(batch_src)) / ((batch_t + 1).view(1, -1))).view(-1)
+            intensity = 0.5 * ( decoder.THP_intensity_singleType(embeddings_u, embeddings_v, temporal_all_td).view(-1, len(batch_src)) +
+                                decoder.THP_intensity_singleType(embeddings_v, embeddings_u, temporal_all_td).view(-1, len(batch_src)) )
         else:
             intensity = decoder.hawkes_intensity_singleType(embeddings_u, embeddings_v, all_td).view(-1, len(batch_src))
 
@@ -394,8 +404,8 @@ def time_pred_unitsample(batch_src, batch_pos_dst, batch_z, batch_assoc, symmetr
         return_time_pred = (timestep * 0.5 * (t_sample[:-1] + t_sample[1:])).sum(dim=0)
     return return_time_pred
 
-def train(dataset, batch_size=200, total_batches=552, return_time_hr=None, time_prediction=False, link_prediction=False,
-          time_pred_loss=False):
+def train(dataset, batch_size=200, total_batches=552, return_time_hr=None, last_time_hr=None,
+          time_prediction=False, link_prediction=False, time_pred_loss=False):
     dataset_len = dataset.num_events
 
     memory.train()
@@ -440,19 +450,19 @@ def train(dataset, batch_size=200, total_batches=552, return_time_hr=None, time_
 
         ######### likelihood for the specific event
         num_samples_ll = 100 + 1
-        last_time_pos = torch.cat((last_update[edge_index[0]].view(-1, 1),
-                                   last_update[edge_index[1]].view(-1, 1)), dim=1)
-        if last_time_pos.size(0) != 0:
-            last_time_pos = last_time_pos.max(-1)[0]
-
-        td_ll = last_time_pos.view(-1) - data.dt_hr[e_id]
-        time_step_ll = td_ll / (num_samples_ll - 1)
-
-        td_ll_base = torch.linspace(0, num_samples_ll-1, num_samples_ll).unsqueeze(1) \
-            .repeat(1, len(e_id)).to(device)
-
-        # [num_samples_ll x batch_size]
-        all_td_ll = td_ll_base * (time_step_ll.view(1, -1))
+        # last_time_pos = torch.cat((last_update[edge_index[0]].view(-1, 1),
+        #                            last_update[edge_index[1]].view(-1, 1)), dim=1)
+        # if last_time_pos.size(0) != 0:
+        #     last_time_pos = last_time_pos.max(-1)[0]
+        #
+        # td_ll = last_time_pos.view(-1) - data.dt_hr[e_id]
+        # time_step_ll = td_ll / (num_samples_ll - 1)
+        #
+        # td_ll_base = torch.linspace(0, num_samples_ll-1, num_samples_ll).unsqueeze(1) \
+        #     .repeat(1, len(e_id)).to(device)
+        #
+        # # [num_samples_ll x batch_size]
+        # all_td_ll = td_ll_base * (time_step_ll.view(1, -1))
 
         ########### not update node embedding from gnn
         embeddings_u_non = z[assoc[src]].clone().repeat(num_samples_ll, 1)
@@ -461,9 +471,10 @@ def train(dataset, batch_size=200, total_batches=552, return_time_hr=None, time_
         # embeddings_u_non, embeddings_v_non = [], []
         # for i in range(num_samples_ll):
         #     t_enc = gnn.time_enc(all_td_ll[i, :].to(z_memory.dtype))
-        #     z_update = gnn.conv(z_memory, edge_index, t_enc)
-        #     embeddings_u_non.append(z_update[src].clone())
-        #     embeddings_v_non.append(z_update[pos_dst].clone())
+        #     sample_edge_attr = torch.cat([t_enc, data.msg[e_id]], dim=-1)
+        #     z_update = gnn.conv(z_memory, edge_index, sample_edge_attr)
+        #     embeddings_u_non.append(z_update[assoc[src]].clone())
+        #     embeddings_v_non.append(z_update[assoc[pos_dst]].clone())
         # embeddings_u_non = torch.stack(embeddings_u_non, dim=0)
         # embeddings_v_non = torch.stack(embeddings_v_non, dim=0)
 
@@ -480,7 +491,7 @@ def train(dataset, batch_size=200, total_batches=552, return_time_hr=None, time_
 
         else:
             loss_lambda, loss_surv, _ = decoder(z, assoc, src, pos_dst, last_update, t,
-                                                   embeddings_u_non, embeddings_v_non, all_td_ll, time_step_ll)
+                                                   embeddings_u_non, embeddings_v_non)
 
         loss = loss_lambda + loss_surv
 
@@ -521,7 +532,7 @@ def train(dataset, batch_size=200, total_batches=552, return_time_hr=None, time_
             # return_time_pred = return_time_pred.cpu().numpy() * train_td_hr_std + train_td_hr_mean
             # return_time_pred = return_time_pred.cpu().numpy()
             ########## unit sample and time step for time prediction
-            return_time_pred = time_pred_unitsample(src, pos_dst, z, assoc, symmetric=True)
+            return_time_pred = time_pred_unitsample(src, pos_dst, z, assoc, t, symmetric=True)
             batch_return_time = return_time_hr[batch_id * batch_size:(batch_id * batch_size + batch.num_events)]
 
             mae = (abs(return_time_pred - batch_return_time)).mean()
@@ -550,8 +561,8 @@ def train(dataset, batch_size=200, total_batches=552, return_time_hr=None, time_
         total_loss_surv += float(loss_surv) * batch.num_events
         total_loss_tp += float(loss_tp) * batch.num_events
 
-        if batch_id > 20:
-            break
+        # if batch_id > 20:
+        #     break
 
     return total_loss / dataset_len, total_loss_lambda/dataset_len, \
            total_loss_surv/dataset_len, total_mae/dataset_len,  \
@@ -559,7 +570,7 @@ def train(dataset, batch_size=200, total_batches=552, return_time_hr=None, time_
 
 
 @torch.no_grad()
-def test(inference_data, return_time_hr=None):
+def test(inference_data, return_time_hr=None, last_time_hr=None):
     memory.eval()
     gnn.eval()
     decoder.eval()
@@ -592,19 +603,19 @@ def test(inference_data, return_time_hr=None):
         z = gnn(z_memory, last_update, edge_index, data.t[e_id], data.msg[e_id])
 
         num_samples_ll= 100 + 1
-        last_time_pos = torch.cat((last_update[edge_index[0]].view(-1, 1),
-                                   last_update[edge_index[1]].view(-1, 1)), dim=1)
-        if last_time_pos.size(0)!=0:
-            last_time_pos = last_time_pos.max(-1)[0]
-
-        td_ll = last_time_pos.view(-1) - data.dt_hr[e_id]
-        time_step_ll = td_ll / (num_samples_ll - 1)
-
-        td_ll_base = torch.linspace(0, num_samples_ll-1, num_samples_ll).unsqueeze(1) \
-            .repeat(1, len(e_id)).to(device)
-
-        # [num_samples_ll x batch_size]
-        all_td_ll = td_ll_base * time_step_ll.view(1, -1)
+        # last_time_pos = torch.cat((last_update[edge_index[0]].view(-1, 1),
+        #                            last_update[edge_index[1]].view(-1, 1)), dim=1)
+        # if last_time_pos.size(0)!=0:
+        #     last_time_pos = last_time_pos.max(-1)[0]
+        #
+        # td_ll = last_time_pos.view(-1) - data.dt_hr[e_id]
+        # time_step_ll = td_ll / (num_samples_ll - 1)
+        #
+        # td_ll_base = torch.linspace(0, num_samples_ll-1, num_samples_ll).unsqueeze(1) \
+        #     .repeat(1, len(e_id)).to(device)
+        #
+        # # [num_samples_ll x batch_size]
+        # all_td_ll = td_ll_base * time_step_ll.view(1, -1)
 
         ########### not update node embedding from gnn
         embeddings_u_non = z[assoc[src]].repeat(num_samples_ll, 1)
@@ -613,9 +624,10 @@ def test(inference_data, return_time_hr=None):
         # embeddings_u_non, embeddings_v_non = [], []
         # for i in range(num_samples_ll):
         #     t_enc = gnn.time_enc(all_td_ll[i, :].to(z_memory.dtype))
-        #     z_update = gnn.conv(z_memory, edge_index, t_enc)
-        #     embeddings_u_non.append(z_update[src].clone())
-        #     embeddings_v_non.append(z_update[pos_dst].clone())
+        #     sample_edge_attr = torch.cat([t_enc, data.msg[e_id]], dim=-1)
+        #     z_update = gnn.conv(z_memory, edge_index, sample_edge_attr)
+        #     embeddings_u_non.append(z_update[assoc[src]].clone())
+        #     embeddings_v_non.append(z_update[assoc[pos_dst]].clone())
         # embeddings_u_non = torch.stack(embeddings_u_non, dim=0)
         # embeddings_v_non = torch.stack(embeddings_v_non, dim=0)
 
@@ -664,8 +676,14 @@ def test(inference_data, return_time_hr=None):
         # embeddings_u = torch.stack(embeddings_u, dim=0)
         # embeddings_v = torch.stack(embeddings_v, dim=0)
 
-        intensity = 0.5 * ( decoder.hawkes_intensity_singleType(embeddings_u, embeddings_v, all_td).view(-1, len(src)) +
-                            decoder.hawkes_intensity_singleType(embeddings_v, embeddings_u, all_td).view(-1, len(src)) )
+        # intensity = 0.5 * ( decoder.hawkes_intensity_singleType(embeddings_u, embeddings_v, all_td).view(-1, len(src)) +
+        #                     decoder.hawkes_intensity_singleType(embeddings_v, embeddings_u, all_td).view(-1, len(src)) )
+        temporal_all_td = (all_td.view(-1, len(src)) / ((t+1).view(1,-1))).view(-1)
+        intensity = 0.5 * (
+                    decoder.THP_intensity_singleType(embeddings_u, embeddings_v,  temporal_all_td)
+                    .view(-1, len(src)) +
+                    decoder.THP_intensity_singleType(embeddings_v, embeddings_u,  temporal_all_td)
+                    .view(-1, len(src)))
 
         integral = torch.cumsum(timestep * intensity, dim=0)
         density = (intensity * torch.exp(-integral))
@@ -676,7 +694,7 @@ def test(inference_data, return_time_hr=None):
         neighbor_loader.insert(src, pos_dst)
         batch_return_time = return_time_hr[batch_id * 200:(batch_id * 200 + batch.num_events)]
         mae = np.mean(abs((return_time_pred - batch_return_time).cpu().numpy()))
-        if batch_id % 20 == 0:
+        if batch_id % 50 == 0:
             print("Test Batch {}, loss {}, MAE for time prediction {}, ap {}".format(batch_id+1, loss, mae, ap))
         total_maes += mae*len(batch.src)
         time_maes.append(mae)
@@ -697,8 +715,12 @@ early_stop = args.early_stop
 min_target = float('inf')
 train_return_hr = torch.tensor(train_return_hr, device=device)
 val_return_hr = torch.tensor(val_return_hr, device=device)
+train_last_hr = torch.tensor(all_last_hr[:len(train_data)], device=device)
+val_last_hr = torch.tensor(all_last_hr[len(train_data):(len(train_data)+len(val_data))], device=device)
+all_last_hr = torch.tensor(all_last_hr, device=device)
 for epoch in range(1, epochs+1): #51
     loss, loss_lambda, loss_surv, train_mae, train_ap, train_loss_tp = train(train_data, return_time_hr=train_return_hr,
+                                                                             last_time_hr=train_last_hr,
                                                                              time_prediction=True, link_prediction=True)#, batch_size=5, total_batches=4
     all_loss.append(loss)
     all_loss_lambda.append(loss_lambda)
@@ -707,7 +729,7 @@ for epoch in range(1, epochs+1): #51
     all_train_ap.append(train_ap)
     print(f'  Epoch: {epoch:02d}, Loss: {loss:.4f}, loss_lambda:{loss_lambda:.4f}, '
           f'loss_surv_u:{loss_surv:.4f}, train mae {train_mae:.4f}, train ap {train_ap: .4f}')
-    val_ap, val_auc, val_loss, val_mae = test(val_data, val_return_hr)
+    val_ap, val_auc, val_loss, val_mae = test(val_data, val_return_hr, val_last_hr)
     print(f' Epoch: {epoch:02d}, Val AP: {val_ap:.4f},  Val AUC: {val_auc:.4f}, Val LOSS: {val_loss:.4f}, Val MAE: {val_mae:.4f}')
     all_test_ap.append(val_ap)
     all_test_auc.append(val_auc)
@@ -742,7 +764,7 @@ plt.title("train link prediction ap")
 plt.subplot(1,3,3)
 plt.plot(np.arange(1, len(all_train_mae)+1), np.array(all_train_mae), 'b')
 plt.title("train time prediction mae")
-fig.savefig('record/01exp_tpll/wiki0326/01tgnHawkes_wiki_train.png')
+fig.savefig('record/01exp_tpll/01tgnHawkes_wiki_train.png')
 
 fig2 = plt.figure(figsize=(18, 5))
 plt.subplot(1,3,1)
@@ -754,7 +776,7 @@ plt.title("test ap")
 plt.subplot(1,3,3)
 plt.plot(np.arange(1, len(all_test_mae)+1), np.array(all_test_mae), 'b')
 plt.title("test mae")
-fig2.savefig('record/01exp_tpll/wiki0326/01tgnHawkes_wiki_test.png')
+fig2.savefig('record/01exp_tpll/01tgnHawkes_wiki_test.png')
 
 print(f'Minimum time prediction MAE in the test set: {min_target: .4f}')
 print('Max link prediction ap in the test set: {}'.format(max(all_test_ap)))
