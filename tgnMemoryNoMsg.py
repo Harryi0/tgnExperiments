@@ -52,7 +52,7 @@ class TGNMemory(torch.nn.Module):
 
         self.register_buffer('memory', torch.empty(num_nodes, memory_dim))
         # last_update = torch.empty(self.num_nodes, dtype=torch.long)
-        last_update = torch.ones(self.num_nodes, dtype=torch.float)
+        last_update = torch.empty(self.num_nodes, dtype=initial_ts.dtype)
         self.register_buffer('last_update', last_update)
         self.register_buffer('__assoc__',
                              torch.empty(num_nodes, dtype=torch.long))
@@ -77,7 +77,7 @@ class TGNMemory(torch.nn.Module):
         """Resets the memory to its initial state."""
         zeros(self.memory)
         zeros(self.last_update)
-        # self.last_update += self.initial_ts
+        self.last_update += self.initial_ts
         self.__reset_message_store__()
 
     def detach(self):
