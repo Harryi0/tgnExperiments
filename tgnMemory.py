@@ -2,6 +2,7 @@ import copy
 from typing import Callable, Tuple
 
 import torch
+import numpy as np
 from torch import Tensor
 from torch.nn import Linear, GRUCell
 from torch_scatter import scatter, scatter_max
@@ -34,7 +35,7 @@ class TGNMemory(torch.nn.Module):
     """
     def __init__(self, num_nodes: int, raw_msg_dim: int, memory_dim: int,
                  time_dim: int, message_module: Callable,
-                 aggregator_module: Callable):
+                 aggregator_module: Callable, initial_ts):
         super(TGNMemory, self).__init__()
 
         self.num_nodes = num_nodes
@@ -50,7 +51,7 @@ class TGNMemory(torch.nn.Module):
 
         self.register_buffer('memory', torch.empty(num_nodes, memory_dim))
         # last_update = torch.empty(self.num_nodes, dtype=torch.long)
-        last_update = torch.empty(self.num_nodes, dtype=torch.float)
+        last_update = torch.empty(self.num_nodes, dtype=initial_ts.dtype)
         self.register_buffer('last_update', last_update)
         self.register_buffer('__assoc__',
                              torch.empty(num_nodes, dtype=torch.long))
@@ -280,3 +281,179 @@ class LastNeighborLoader(object):
     def reset_state(self):
         self.cur_e_id = 0
         self.e_id.fill_(-1)
+
+class NeighborLoader(object):
+    def __init__(self, num_nodes: int, size: int, device=None, store_all=False):
+        self.num_nodes = num_nodes
+        self.size = size
+
+        self.neighbors = torch.empty((num_nodes, size), dtype=torch.long,
+                                     device=device)
+        self.e_id = torch.empty((num_nodes, size), dtype=torch.long,
+                                device=device)
+        self.store_all = store_all
+        if store_all:
+            self.neighbors_allb = [[] for _ in range(num_nodes)]
+            self.e_id_allb = [[] for _ in range(num_nodes)]
+            self.update_time = [[] for _ in range(num_nodes)]
+            self.last_update_time = [[] for _ in range(num_nodes)]
+        self.__assoc__ = torch.empty(num_nodes, dtype=torch.long,
+                                     device=device)
+
+        self.reset_state()
+
+    def __call__(self, n_id):
+        neighbors = self.neighbors[n_id]
+        nodes = n_id.view(-1, 1).repeat(1, self.size)
+        e_id = self.e_id[n_id]
+
+        # Filter invalid neighbors (identified by `e_id < 0`).
+        mask = e_id >= 0
+        neighbors, nodes, e_id = neighbors[mask], nodes[mask], e_id[mask]
+
+        # Relabel node indices.
+        n_id = torch.cat([n_id, neighbors]).unique()
+        self.__assoc__[n_id] = torch.arange(n_id.size(0), device=n_id.device)
+        neighbors, nodes = self.__assoc__[neighbors], self.__assoc__[nodes]
+
+        return n_id, torch.stack([neighbors, nodes]), e_id
+
+    def __insert__(self, src, dst, end_t, last_update):
+        # Inserts newly encountered interactions into an ever growing
+        # (undirected) temporal graph.
+
+        # Collect central nodes, their neighbors and the current event ids.
+        neighbors = torch.cat([src, dst], dim=0)
+        nodes = torch.cat([dst, src], dim=0)
+        e_id = torch.arange(self.cur_e_id, self.cur_e_id + src.size(0),
+                            device=src.device).repeat(2)
+        self.cur_e_id += src.numel()
+
+        # Convert newly encountered interaction ids so that they point to
+        # locations of a "dense" format of shape [num_nodes, size].
+        nodes, perm = nodes.sort()
+        neighbors, e_id = neighbors[perm], e_id[perm]
+
+        n_id = nodes.unique()
+        self.__assoc__[n_id] = torch.arange(n_id.numel(), device=n_id.device)
+
+        dense_id = torch.arange(nodes.size(0), device=nodes.device) % self.size
+        dense_id += self.__assoc__[nodes].mul_(self.size)
+
+        dense_e_id = e_id.new_full((n_id.numel() * self.size, ), -1)
+        dense_e_id[dense_id] = e_id
+        dense_e_id = dense_e_id.view(-1, self.size)
+
+        dense_neighbors = e_id.new_empty(n_id.numel() * self.size)
+        dense_neighbors[dense_id] = neighbors
+        dense_neighbors = dense_neighbors.view(-1, self.size)
+
+        # Collect new and old interactions...
+        e_id = torch.cat([self.e_id[n_id, :self.size], dense_e_id], dim=-1)
+        neighbors = torch.cat(
+            [self.neighbors[n_id, :self.size], dense_neighbors], dim=-1)
+
+        # And sort them based on `e_id`.
+        e_id, perm = e_id.topk(self.size, dim=-1)
+        self.e_id[n_id] = e_id
+        self.neighbors[n_id] = torch.gather(neighbors, 1, perm)
+
+        if self.store_all:
+            for i, n_i in enumerate(n_id):
+                self.e_id_allb[n_i].append(self.e_id[n_i].clone())
+                self.neighbors_allb[n_i].append(self.neighbors[n_i].clone())
+                self.update_time[n_i].append(end_t)
+                self.last_update_time[n_i].append(last_update[i])
+
+    def find_before(self, n_id, ts):
+        neighbors, e_id, last_update = [], [], []
+        for i, n_i in enumerate(n_id):
+            if not self.update_time[n_i]:
+                update = torch.tensor([], device=n_id.device)
+            else:
+                update = torch.stack(self.update_time[n_i])
+            idx = torch.searchsorted(update, ts, right=True).item()-1
+            # idx = update[(update<ts)].size(0)-1
+            if idx==-1:
+                e_id.append(self.e_id.new_full((self.size,), -1))
+                neighbors.append(self.e_id.new_full((self.size,), -1))
+            else:
+                e_id.append(self.e_id_allb[n_i][idx])
+                neighbors.append(self.neighbors_allb[n_i][idx])
+
+        neighbors = torch.stack(neighbors)
+        e_id = torch.stack(e_id)
+
+        nodes = n_id.view(-1, 1).repeat(1, self.size)
+
+        # Filter invalid neighbors (identified by `e_id < 0`).
+        mask = e_id >= 0
+        neighbors, nodes, e_id = neighbors[mask], nodes[mask], e_id[mask]
+
+        n_id = torch.cat([n_id, neighbors]).unique()
+        for i, n_i in enumerate(n_id):
+            if not self.update_time[n_i]:
+                update = torch.tensor([], device=n_id.device)
+            else:
+                update = torch.stack(self.update_time[n_i])
+            idx = torch.searchsorted(update, ts, right=True).item() - 1
+            if idx==-1:
+                last_update.append(torch.tensor(0, dtype=ts.dtype, device=n_id.device))
+            else:
+                last_update.append(self.last_update_time[n_i][idx])
+        last_update = torch.stack(last_update)
+        # Relabel node indices.
+        self.__assoc__[n_id] = torch.arange(n_id.size(0), device=n_id.device)
+        neighbors, nodes = self.__assoc__[neighbors], self.__assoc__[nodes]
+
+        return n_id, torch.stack([neighbors, nodes]), e_id, last_update
+
+
+    def insert(self, src, dst):
+        # Inserts newly encountered interactions into an ever growing
+        # (undirected) temporal graph.
+
+        # Collect central nodes, their neighbors and the current event ids.
+        neighbors = torch.cat([src, dst], dim=0)
+        nodes = torch.cat([dst, src], dim=0)
+        e_id = torch.arange(self.cur_e_id, self.cur_e_id + src.size(0),
+                            device=src.device).repeat(2)
+        self.cur_e_id += src.numel()
+
+        # Convert newly encountered interaction ids so that they point to
+        # locations of a "dense" format of shape [num_nodes, size].
+        nodes, perm = nodes.sort()
+        neighbors, e_id = neighbors[perm], e_id[perm]
+
+        n_id = nodes.unique()
+        self.__assoc__[n_id] = torch.arange(n_id.numel(), device=n_id.device)
+
+        dense_id = torch.arange(nodes.size(0), device=nodes.device) % self.size
+        dense_id += self.__assoc__[nodes].mul_(self.size)
+
+        dense_e_id = e_id.new_full((n_id.numel() * self.size, ), -1)
+        dense_e_id[dense_id] = e_id
+        dense_e_id = dense_e_id.view(-1, self.size)
+
+        dense_neighbors = e_id.new_empty(n_id.numel() * self.size)
+        dense_neighbors[dense_id] = neighbors
+        dense_neighbors = dense_neighbors.view(-1, self.size)
+
+        # Collect new and old interactions...
+        e_id = torch.cat([self.e_id[n_id, :self.size], dense_e_id], dim=-1)
+        neighbors = torch.cat(
+            [self.neighbors[n_id, :self.size], dense_neighbors], dim=-1)
+
+        # And sort them based on `e_id`.
+        e_id, perm = e_id.topk(self.size, dim=-1)
+        self.e_id[n_id] = e_id
+        self.neighbors[n_id] = torch.gather(neighbors, 1, perm)
+
+    def reset_state(self):
+        self.cur_e_id = 0
+        self.e_id.fill_(-1)
+        if self.store_all:
+            self.neighbors_allb = [[] for _ in range(self.num_nodes)]
+            self.e_id_allb = [[] for _ in range(self.num_nodes)]
+            self.update_time = [[] for _ in range(self.num_nodes)]
+            self.last_update_time = [[] for _ in range(self.num_nodes)]
